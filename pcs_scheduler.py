@@ -1,6 +1,10 @@
 # ---------------------------------------------------------------------------------------------
 # Blox Abstractions for PCS:
 # ---------------------------------------------------------------------------------------------
+
+# *[TO-DO]      -> Will actively need to add/ edit stuff to make it work
+# *[NO CHANGES] -> Blox already has what we need. No/ little changes needed
+
 #
 # 1. JOB ADMISSION [NO CHANGES]:
 #    -> Accept-All in FIFO initially (in fixed number of WFQ Queues)
