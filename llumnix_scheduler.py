@@ -1,3 +1,62 @@
+# ------------------------------------------------------------------------------------------------------------------------
+# Blox Abstractions for Llumnix:
+# ------------------------------------------------------------------------------------------------------------------------
+#
+#                        ------------------- (PREEMPTION) -----------------
+#                       |                                                  |
+#                       V                                                  | 
+# (ADMISSION) -> (SCHEDULING) -> (PLACEMENT) -> (LAUNCH / RESUME) -> [RUNNING JOB]
+#                       ^           ^                                      ^
+#                       |           |                                      |
+#                    (CLUSTER MANAGEMENT) <---------------------- (METRICS COLLECTION)
+#
+#
+# *[TO-DO]      -> Will actively need to add/ edit stuff to make it work
+# *[NO CHANGES] -> Blox already has what we need. No/ little changes needed
+#
+#
+# 1. JOB ADMISSION [TO-DO]:
+#    -> Accept-All but add priority and resource requirements in JobState
+#
+# 2. JOB SCHEDULING [TO-DO]:
+#    -> Load-aware, priority-supported scheduling and move jobs when new instances are added/ removed
+#    -> Calculate "virtual load" (updated by Metrics Collector) for all active jobs per cluster
+#    -> Iterate over JobStates and store aggregated load in ClusterState
+#    -> Compare loads across all clusters. Choose one that is the most overloaded
+#    -> Pick a job to move to least loaded cluster (eg: move heaviest job)
+#    -> Selected job to move will be scheduled on new cluster
+#    -> "Job Placement" will handle from this point on
+#
+# 3. JOB PLACEMENT [TO-DO]:
+#    -> Load-aware Placement Policy
+#    -> New jobs can be placed on instances with most amount of free memory
+#    -> Job Migration - Check ClusterState and move job to the least loaded instance
+#
+# 4. JOB PREEMPTION [TO-DO]:
+#    -> When to preempt - if job is already running but is scheduled to run on different instance
+#    -> Start saving job state and vLLM state (via API) in JobState while job is still running
+#    -> Once (almost) done with state migration - pause job, copy state to new instance
+#    -> Set job as "preempted" and update ClusterState accordingly
+#    -> Resuming on another instance is handled by "Job Launch" (whenever this job is scheduled next)
+#
+# 5. JOB LAUNCH [TO-DO]:
+#    -> If new job (no existing state), run it
+#    -> If migrated job (saved state exists), load from state and resume
+#    -> Update JobState accordingly
+#
+# 6. CLUSTER MANAGEMENT [TO-DO]:
+#    -> Llumnix works on scaling machines instead of jobs
+#    -> Have a "ClusterManager" with a global "ClusterState" (all active GPUs w/ utilizations)
+#    -> ClusterManager can "add" or "terminate" instance to scale up/down and saturate/ drain instances
+#
+# 7. METRIC COLLECTION [TO-DO]:
+#    -> vLLM API to get GPU memory usage and job status concurrently (RPC call?)
+#    -> Update JobState and ClusterState (before next round of scheduling)
+#    -> These updated metrics will help in optimal scheduling
+#
+# ---------------------------------------------------------------------------------------------------
+ 
+
 import os
 import sys
 import warnings
