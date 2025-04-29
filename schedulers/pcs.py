@@ -32,19 +32,11 @@ class Pcs(SchedulingPolicy):
         gpu_df: pd.DataFrame,
         global_placement_policy: Optional[str] = None,
     ) -> dict:
-        # get all jobs -> demand mapping (demand: n resources -> T execution time)
-        jobs = []
-        for job_id, job_info in job_dict.items():
-            job_min_gpu_demand = 1
-            job_max_gpu_demand = job_info.get("job_gpu_demand", job_min_gpu_demand)
-            job_time_demand = job_info["job_duration"] / job_max_gpu_demand
-            jobs.append((job_id, job_time_demand))
-
-        # sort jobs in ascending order of their demand
-        jobs.sort(key=lambda x: x[1])
+        # sort jobs in ascending order of their demand(n) = T
+        sorted_jobs = sorted(job_dict.items(), key=lambda x: x[1]["job_time_demand"])
 
         n = 0
-        queue = [jobs[0]]
+        queue = [sorted_jobs[0]]
         demand_sum = 0
         demand_squared_sum = 0
         demand_mean = 0
@@ -54,12 +46,12 @@ class Pcs(SchedulingPolicy):
         buckets = []
         c_squared_history = []
 
-        for i in range(len(jobs)):
+        for i in range(len(sorted_jobs)):
             # include job in the queue
             n += 1
 
             # calculate running demand sum, mean and variance
-            demand = jobs[i][1]
+            demand = sorted_jobs[i][1]
             demand_sum += demand
             demand_squared_sum += (demand * demand)
             demand_mean = ((n - 1) * demand_mean + demand) / n
@@ -74,7 +66,7 @@ class Pcs(SchedulingPolicy):
                 buckets.append(queue[:-1])
                 # reset states and start a new queue
                 n = 0
-                queue = [jobs[i]]
+                queue = [sorted_jobs[i]]
                 demand_sum = 0
                 demand_squared_sum = 0
                 demand_mean = 0
@@ -118,9 +110,9 @@ class Pcs(SchedulingPolicy):
             for qid, b in enumerate(buckets_d):
                 if remaining_allocs[qid] > 0 and b:
                     # update job state to reflect new gpu demands
-                    job_id = b.popleft()[0]
-                    job_dict[job_id]["job_gpu_demand"] = allocs[qid]
-                    schedule_order.append(job_dict)
+                    job = b.popleft()
+                    job[1]["job_gpu_demand"] = allocs[qid]
+                    schedule_order.append(job)
                     remaining_allocs[qid] -= 1
 
         schedule_info = {

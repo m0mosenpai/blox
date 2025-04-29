@@ -25,12 +25,12 @@ class Job:
         job_arrival_time,
         job_iteration_time,
         job_total_iteration,
-        job_gpu_demand,
         job_packing_penalty,
         job_placement_penalty,
         synergy_res_matrix,
         synergy_storage_matrix, 
         tenant_id,
+        job_gpu_demand=1,
         job_cpu_demand=-1,
         job_mem_demand=-1,
         job_sspeed_demand=-1,
@@ -52,6 +52,7 @@ class Job:
         self.job_cpu_demand = job_cpu_demand
         self.job_mem_demand = job_mem_demand
         self.job_sspeed_demand = job_sspeed_demand
+        self.job_time_demand = self.job_duration / self.job_gpu_demand
 
         self.job_gpu_demand_orig = job_gpu_demand
         self.job_cpu_demand_orig = job_cpu_demand
