@@ -32,17 +32,13 @@ class Pcs(SchedulingPolicy):
         gpu_df: pd.DataFrame,
         global_placement_policy: Optional[str] = None,
     ) -> dict:
-        # TO-DO: can be optionally provided by the user
-        # TO-DO: demand can be handled inside JobState itself
         # get all jobs -> demand mapping (demand: n resources -> T execution time)
         jobs = []
-        for job_id, job_info in job_dict.items():
-            demand_map = job_info.get("demand_map")
-            if demand_map:
-                job_demand = demand_map.get(job_info.get("min_alloc", 1), demand_map[max(demand_map)])
-            else:
-                job_demand = job_info["tracked_metrics"].get("remaining_time", 0)
-            jobs.append((job_id, job_demand))
+        for job_info in job_dict.values():
+            job_min_gpu_demand = 1
+            job_max_gpu_demand = job_info.get("job_gpu_demand", job_min_gpu_demand)
+            job_time_demand = job_info["job_duration"] / job_max_gpu_demand
+            jobs.append((job_dict, job_time_demand))
 
         # sort jobs in ascending order of their demand
         jobs.sort(key=lambda x: x[1])
@@ -76,8 +72,6 @@ class Pcs(SchedulingPolicy):
             # split queue if C^2 exceeds T
             if (c_squared > self.covariance_threshold):
                 buckets.append(queue[:-1])
-                # threshold_queues.append(int(jobs[i - 1][1]))
-
                 # reset states and start a new queue
                 n = 0
                 queue = [jobs[i]]
@@ -99,34 +93,34 @@ class Pcs(SchedulingPolicy):
         assert all(list(map(lambda w: w > 0 and w <= 1.0, weights)))
         assert np.isclose(float(sum(weights)), 1.0)
 
-        # get gpu usage statistics
-        num_gpus = len(gpu_df)
-        used_gpus = 0
-        for gpu in gpu_df:
-            if gpu["IN_USE"]:
-                used_gpus += 1
+        # get number of gpus to hand out
+        free_gpus = self._get_free_gpus(gpu_df)
 
         # initial GPU allocations per-queue (floor to round the weights)
-        ideal_allocs = [w * num_gpus for w in weights]
+        ideal_allocs = [w * free_gpus for w in weights]
         allocs = [math.floor(x) for x in ideal_allocs]
-        # redistribute leftover to gpu with largest fractional diff
+        leftovers = free_gpus - sum(allocs)
+        # distribute leftover jobs to gpus in descending order of largest fractional diff
         fractions = [((ideal_allocs[i] - allocs[i]), i) for i in range(len(allocs))]
         fractions.sort(key=lambda x: x[0], reverse=True)
-        allocs[fractions[0][1]] += 1
-
+        for i in range(leftovers):
+            allocs[fractions[i][1]] += 1
         # sanity checks
-        assert num_gpus == sum(allocs)
+        assert free_gpus == sum(allocs)
 
         # convert buckets to deques for efficient dispatching
         buckets_d = [deque(b) for b in buckets]
         remaining_allocs = allocs[:]
 
-        # dispath RR over FIFO queues
+        # dispatch RR over FIFO queues
         schedule_order = []
         while any(remaining_allocs):
             for qid, b in enumerate(buckets_d):
                 if remaining_allocs[qid] > 0 and b:
-                    schedule_order.append(b.popleft())
+                    # update job states to reflect updated gpu demands
+                    job_dict = b.popleft()[0]
+                    job_dict["job_gpu_demand"] = allocs[qid]
+                    schedule_order.append(job_dict)
                     remaining_allocs[qid] -= 1
 
         schedule_info = {
@@ -134,3 +128,13 @@ class Pcs(SchedulingPolicy):
             "run_all_jobs": True
         }
         return schedule_info
+
+    def _get_free_gpus(self, gpu_df: pd.DataFrame):
+        free_gpus = (
+            gpu_df.loc[gpu_df["IN_USE"] == False]
+            .groupby("Node_ID")["GPU_ID"]
+            .apply(list)
+            .to_dict()
+        )
+        number_free_gpus = sum([len(free_gpus[x]) for x in free_gpus])
+        return number_free_gpus
