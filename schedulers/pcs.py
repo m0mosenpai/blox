@@ -32,6 +32,9 @@ class Pcs(SchedulingPolicy):
         gpu_df: pd.DataFrame,
         global_placement_policy: Optional[str] = None,
     ) -> dict:
+        for job in job_dict:
+            job_dict[job]["job_time_demand"] = job_dict[job]["job_duration"] / job_dict[job]["job_gpu_demand"]
+
         # sort jobs in ascending order of their demand(n) = T
         sorted_jobs = sorted(job_dict.items(), key=lambda x: x[1]["job_time_demand"])
 
