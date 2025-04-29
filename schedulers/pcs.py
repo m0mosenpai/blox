@@ -34,11 +34,11 @@ class Pcs(SchedulingPolicy):
     ) -> dict:
         # get all jobs -> demand mapping (demand: n resources -> T execution time)
         jobs = []
-        for job_info in job_dict.values():
+        for job_id, job_info in job_dict.items():
             job_min_gpu_demand = 1
             job_max_gpu_demand = job_info.get("job_gpu_demand", job_min_gpu_demand)
             job_time_demand = job_info["job_duration"] / job_max_gpu_demand
-            jobs.append((job_dict, job_time_demand))
+            jobs.append((job_id, job_time_demand))
 
         # sort jobs in ascending order of their demand
         jobs.sort(key=lambda x: x[1])
@@ -100,7 +100,7 @@ class Pcs(SchedulingPolicy):
         ideal_allocs = [w * free_gpus for w in weights]
         allocs = [math.floor(x) for x in ideal_allocs]
         leftovers = free_gpus - sum(allocs)
-        # distribute leftover jobs to gpus in descending order of largest fractional diff
+        # distribute leftover jobs to gpus in descending order of fractional diff
         fractions = [((ideal_allocs[i] - allocs[i]), i) for i in range(len(allocs))]
         fractions.sort(key=lambda x: x[0], reverse=True)
         for i in range(leftovers):
@@ -117,9 +117,9 @@ class Pcs(SchedulingPolicy):
         while any(remaining_allocs):
             for qid, b in enumerate(buckets_d):
                 if remaining_allocs[qid] > 0 and b:
-                    # update job states to reflect updated gpu demands
-                    job_dict = b.popleft()[0]
-                    job_dict["job_gpu_demand"] = allocs[qid]
+                    # update job state to reflect new gpu demands
+                    job_id = b.popleft()[0]
+                    job_dict[job_id]["job_gpu_demand"] = allocs[qid]
                     schedule_order.append(job_dict)
                     remaining_allocs[qid] -= 1
 
