@@ -42,6 +42,7 @@ import os
 import warnings
 import sys
 import argparse
+import json
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
@@ -126,12 +127,16 @@ def parse_args(parser):
         help="PCS WFQ Class Variance Threshold T (squared CV limit for job size grouping)"
     )
     parser.add_argument(
-        "--pcs-w", type=float, default=0.5,
+        "--pcs-w", type=float, default=0.1,
         help="PCS WFQ Weight Decay Factor W between classes (0<W<=1). Smaller value gives more weight to short-job classes"
     )
     parser.add_argument(
         "--pcs-z", type=float, default=0.5,
         help="PCS Minimum Efficiency Threshold Z for Resource Capping (0<Z<=1). Smaller value means more tolerant to inefficient scaling"
+    )
+    parser.add_argument(
+        "--demand-map", type=json.loads,
+        help="PCS Demand Map {<gpu_count>: <time>}"
     )
 
     args = parser.parse_args()

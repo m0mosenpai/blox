@@ -19,10 +19,9 @@ class Pcs(SchedulingPolicy):
         """
         self.metric_to_track = ["per_iter_time", "attained_service"]
         self.default_metric_value = [0, 0]
-        self.covariance_threshold = getattr(args, "pcs_t")
-        self.weight_decay = getattr(args, "pcs_w")
-        # TO-DO
-        # self.Z = getattr(args, "pcs_z")
+        self.covariance_threshold = args.pcs_t
+        self.weight_decay = args.pcs_w
+        self.demand_cap = args.pcs_z
 
     @SchedulingPolicy.copy_arguments
     def schedule(
@@ -34,6 +33,7 @@ class Pcs(SchedulingPolicy):
     ) -> dict:
         for job in job_dict:
             job_dict[job]["job_time_demand"] = job_dict[job]["job_duration"] / job_dict[job]["job_gpu_demand"]
+            job_dict[job]["demand_fn"] = lambda n: job_dict[job]["job_duration"] / n
 
         # sort jobs in ascending order of their demand(n) = T
         sorted_jobs = sorted(job_dict.items(), key=lambda x: x[1]["job_time_demand"])
@@ -107,14 +107,24 @@ class Pcs(SchedulingPolicy):
         buckets_d = [deque(b) for b in buckets]
         remaining_allocs = allocs[:]
 
-        # dispatch RR over FIFO queues
+        # schedule jobs from FIFO queues in RR
         schedule_order = []
         while any(remaining_allocs):
             for qid, b in enumerate(buckets_d):
                 if remaining_allocs[qid] > 0 and b:
-                    # update job state to reflect new gpu demands
                     job = b.popleft()
-                    job[1]["job_gpu_demand"] = allocs[qid]
+                    gpus = allocs[qid]
+
+                    # cap each job to a pre-defined max
+                    max_gpus = 1
+                    for n in range(1, gpus + 1):
+                        t_n = job[1]["demand_fn"](n)
+                        z = job[1]["demand_fn"](1) / (n * t_n)
+                        if z >= self.demand_cap:
+                            max_gpus = n
+
+                    # update job state to reflect new gpu demands
+                    job[1]["job_gpu_demand"] = max_gpus
                     schedule_order.append(job)
                     remaining_allocs[qid] -= 1
 
