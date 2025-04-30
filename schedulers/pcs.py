@@ -5,6 +5,7 @@ from fractions import Fraction as frac
 import numpy as np
 import math
 from collections import deque
+import time
 
 from typing import Optional
 
@@ -122,9 +123,9 @@ class Pcs(SchedulingPolicy):
                         z = job[1]["demand_fn"](1) / (n * t_n)
                         if z >= self.demand_cap:
                             max_gpus = n
-
-                    # update job state to reflect new gpu demands
+                    # update job state to reflect new gpu demands and predicted JCT
                     job[1]["job_gpu_demand"] = max_gpus
+                    job[1]["predicted_JCT"] = time.time() + job[1]["demand_fn"](max_gpus)
                     schedule_order.append(job)
                     remaining_allocs[qid] -= 1
 
