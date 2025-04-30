@@ -33,6 +33,7 @@ class Pcs(SchedulingPolicy):
         global_placement_policy: Optional[str] = None,
     ) -> dict:
         for job in job_dict:
+            # assume linear-scaling if no demand mapping is supplied
             if not job["demand_fn"]:
                 job_dict[job]["demand_fn"] = lambda n: job_dict[job]["job_duration"] / n
 
@@ -50,6 +51,7 @@ class Pcs(SchedulingPolicy):
         buckets = []
         c_squared_history = []
 
+        # reference: https://github.com/TuftsNATLab/PCS/blob/main/simulation/wfq_tuner.py#L243
         for i in range(len(sorted_jobs)):
             # include job in the queue
             n += 1
@@ -77,6 +79,7 @@ class Pcs(SchedulingPolicy):
                 demand_variance = 0
                 num_queues += 1
 
+        # reference: https://github.com/TuftsNATLab/PCS/blob/main/simulation/wfq_tuner.py#L319
         # calculate weights for each queue
         weights = [np.exp(-1.0 * self.weight_decay * i) for i in range(num_queues)]
         weights = list(map(lambda w: w / sum(weights), weights))
@@ -123,6 +126,7 @@ class Pcs(SchedulingPolicy):
                         z = job[1]["demand_fn"](1) / (n * t_n)
                         if z >= self.demand_cap:
                             max_gpus = n
+
                     # update job state to reflect new gpu demands and predicted JCT
                     job[1]["job_gpu_demand"] = max_gpus
                     job[1]["predicted_JCT"] = time.time() + job[1]["demand_fn"](max_gpus)
