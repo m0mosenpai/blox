@@ -135,7 +135,7 @@ def parse_args(parser):
         help="PCS Minimum Efficiency Threshold Z for Resource Capping (0<Z<=1). Smaller value means more tolerant to inefficient scaling"
     )
     parser.add_argument(
-        "--demand-map", type=json.loads,
+        "--demand-fn", type=json.loads,
         help="PCS Demand Map {<gpu_count>: <time>}"
     )
 

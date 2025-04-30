@@ -33,11 +33,11 @@ class Pcs(SchedulingPolicy):
         global_placement_policy: Optional[str] = None,
     ) -> dict:
         for job in job_dict:
-            job_dict[job]["job_time_demand"] = job_dict[job]["job_duration"] / job_dict[job]["job_gpu_demand"]
-            job_dict[job]["demand_fn"] = lambda n: job_dict[job]["job_duration"] / n
+            if not job["demand_fn"]:
+                job_dict[job]["demand_fn"] = lambda n: job_dict[job]["job_duration"] / n
 
         # sort jobs in ascending order of their demand(n) = T
-        sorted_jobs = sorted(job_dict.items(), key=lambda x: x[1]["job_time_demand"])
+        sorted_jobs = sorted(job_dict.items(), key=lambda x: x[1]["demand_fn"](job_dict[job]["job_gpu_demand"]))
 
         n = 0
         queue = [sorted_jobs[0]]
