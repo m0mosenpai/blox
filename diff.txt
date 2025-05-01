@@ -1,0 +1,3224 @@
+diff --git a/blox/blox_manager.py b/blox/blox_manager.py
+index 8adbe1e..b85b69f 100644
+--- a/blox/blox_manager.py
++++ b/blox/blox_manager.py
+@@ -1,535 +1,537 @@
+ 
+-from typing import Tuple, List
+-
+-# import scheduler
+-# import placement
+-
+-# from profile_parsers import pparsers
+-sys.path.append(os.path.dirname(__file__))
+-import deployment.grpc_server_rm as rm_serve
+-import deployment.grpc_client_rm as rm_client
+-
+-# from cluster_state import ClusterState
+-# from job_state import JobState
++# Blox imports
++# Assume these exist and manage their respective states
++from blox.cluster_state import ClusterState
++from blox.job_state import JobState # Adapt this if needed, or use simple dicts
++import blox.deployment.grpc_server_rm as rm_serve # Use updated server start
++import blox.deployment.grpc_client_nm as nm_client # Use updated client
++from schedulers import make_policy # Scheduler factory
+ 
++# Configure logging
++logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
++logger = logging.getLogger(__name__)
+ 
+ class BloxManager(object):
+     """
+-    Implements the Blox bookkeeping interface, including accepting, scheduling and running jobs
++    Central scheduler managing nodes, jobs, and dispatching using a pluggable policy.
+     """
+-
+-    def __init__(self, args: argparse.ArgumentParser) -> None:
++    def __init__(self, args):
+         self.args = args
+
+-    def _get_avg_jct(self, time_dict):
++        self.scheduler_port = args.scheduler_port # Port this RMServer listens on
++        self.node_manager_port = args.node_manager_port # Default port NMs listen on
++
++        # 1. State Management (Adapt or replace with your state classes)
++        self.cluster_state = ClusterState(args) # Tracks nodes, resources
++        self.job_state = JobState(args)       # Tracks active/pending jobs
++
++        # 2. Communication Client (For talking to Node Managers)
++        self.comm_node_manager = nm_client.NodeManagerComm() # No target addr needed in init
++
++        # 3. Inference Request Queue (Priority Queue)
++        # Stores tuples: (priority_val, submit_time, job_details_dict)
++        # Lower priority_val = higher priority
++        self.pending_inference_requests: List[Tuple[int, float, Dict[str, Any]]] = []
++        self.request_lock = threading.Lock() # Protect queue and worker_info access
++
++        # 4. Worker Info Store
++        # Key: Node IP Addr (str), Value: Dict with registration info & status
++        self.worker_info: Dict[str, Dict[str, Any]] = {}
++
++        # 5. Scheduling Policy
++        # Dynamically load policy based on args.policy
++        # Pass necessary state and args to the policy constructor
++        policy_args = {k: getattr(args, k) for k in ["scheduling_interval"] if hasattr(args, k)} # Add policy-specific args
++        try:
++             self.scheduler_policy = make_policy(
++                  args.policy,
++                  cluster_state=self.cluster_state, # Policy might need access
++                  job_state=self.job_state,         # Policy might need access
++                  **policy_args
++             )
++             logger.info(f"Initialized scheduler policy: {args.policy}")
++        except KeyError:
++             logger.error(f"Unknown scheduler policy: {args.policy}. Exiting.")
++             raise ValueError(f"Unknown scheduler policy: {args.policy}")
++
++
++        # 6. Control flags for the main loop
++        self.scheduling_interval_sec = args.scheduling_interval
++        self.scheduler_run_signal = threading.Event() # Used to signal shutdown
++        self.current_simulation_time = 0 # Used by scheduler policy?
++
++    # --- Methods called by RMServer ---
++
++    def register_worker(self, ipaddr, interface, num_gpus, nm_port, available_kv_memory, supported_models):
++        """Handles worker registration, updating cluster state and worker info."""
++        logger.info(f"Registering worker {ipaddr}:{nm_port} (GPUs: {num_gpus}, KV Mem: {available_kv_memory}GB)")
++        with self.request_lock:
++             self.worker_info[ipaddr] = {
++                 "ipaddr": ipaddr,
++                 "port": nm_port,
++                 "interface": interface,
++                 "num_gpus": num_gpus,
++                 "kv_memory_gb": available_kv_memory,
++                 "models": list(supported_models),
++                 "last_seen": time.time(),
++                 "status": "active", # e.g., active, inactive, migrating_from, migrating_to
++                 # Add other state if needed (e.g., local queue depth if reported)
++             }
++        # Update ClusterState representation as well
++        self.cluster_state.add_node(ipaddr, num_gpus) # Adapt ClusterState API
++        return True
++
++    def add_inference_request(self, job_details: dict) -> Tuple[bool, Optional[str], str]:
+         """
+-        Fetch the avg jct from the dict
++        Adds a new inference request from frontend to the pending queue.
++        Assigns a Blox Job ID.
++        Returns: (accepted: bool, job_id: Optional[str], message: str)
+         """
++        priority_str = job_details.get("priority", "normal")
++        priority_map = {"high": 0, "normal": 1, "low": 2}
++        priority_val = priority_map.get(priority_str.lower(), 1)
++        submit_time = job_details.get("submit_time", time.time())
++
++        # Assign a unique Blox Job ID (use string representation)
++        # Using UUID ensures uniqueness even if manager restarts (if state isn't persisted)
++        blox_job_id = str(uuid.uuid4())
++        job_details["job_id"] = blox_job_id # Add to the dict
++
++        # TODO: Check against max queue length if desired
++        max_queue_len = getattr(self.args, "max_global_queue_size", 1000)
++        with self.request_lock:
++            if len(self.pending_inference_requests) >= max_queue_len:
++                 logger.warning(f"Global inference queue full ({max_queue_len}). Rejecting request {job_details['request_id']}.")
++                 return False, None, "Rejected: Global queue full"
++
++            # Use a tuple for heapq: (priority, submission_time, job_details)
++            request_entry = (priority_val, submit_time, job_details)
++            heapq.heappush(self.pending_inference_requests, request_entry)
++            logger.info(f"Queued inference request {job_details['request_id']} as JobID: {blox_job_id} with priority {priority_val}.")
++
++            # Update JobState as well
++            self.job_state.add_job(blox_job_id, job_details) # Adapt JobState API
++
++        return True, blox_job_id, "Request queued"
++
++
++    def handle_job_completion(self, job_id_str: str, success: bool):
++        """Updates job status upon completion notification from Node Manager."""
++        logger.debug(f"Handling completion for job {job_id_str}, Success: {success}")
++        status = "finished" if success else "failed"
++        # Update JobState
++        self.job_state.update_job_status(job_id_str, status) # Adapt JobState API
++        # Update ClusterState (release resources associated with the job)
++        node_ip = self.job_state.get_job_location(job_id_str) # Need method in JobState
++        if node_ip:
++             # Need details on which GPU(s) were used if tracking that level
++             self.cluster_state.release_resources(node_ip, job_id_str) # Adapt ClusterState API
++             logger.info(f"Job {job_id_str} completed on node {node_ip}. Status: {status}.")
+         else:
++             logger.warning(f"Could not find node location for completed job {job_id_str}.")
++
++
++    def handle_migration_completion(self, job_id: str, from_node: str, to_node: str):
++        """Updates job location after successful migration notification."""
++        logger.info(f"Handling migration completion for job {job_id}: {from_node} -> {to_node}")
++        # Update JobState with the new location
++        self.job_state.update_job_location(job_id, to_node) # Adapt JobState API
++        # Update ClusterState if needed (e.g., mark nodes as non-migrating)
++        self.cluster_state.update_node_status(from_node, "active") # Adapt API
++        self.cluster_state.update_node_status(to_node, "active")   # Adapt API
++        with self.request_lock:
++             if from_node in self.worker_info: self.worker_info[from_node]["status"] = "active"
++             if to_node in self.worker_info: self.worker_info[to_node]["status"] = "active"
++
++
++    # --- Main Scheduling Loop ---
++
++    def _run_schedule_and_dispatch(self):
++        """Performs one round of scheduling and dispatches decisions."""
++        self.current_simulation_time += self.scheduling_interval_sec # Advance time if simulating
++
++        # 1. Get current state (make copies if policy modifies them)
++        # These need to be accessible/copyable representations of the state
++        active_jobs_snapshot = self.job_state.get_active_jobs() # Adapt API
++        pending_jobs_snapshot = self.get_pending_requests_snapshot() # Get from queue
++        cluster_snapshot = self.cluster_state.get_cluster_view() # Adapt API
++        worker_snapshot = copy.deepcopy(self.worker_info) # Need deep copy?
++
++        # 2. Call the scheduling policy
++        # Policy should return dispatch decisions and migration decisions
++        # dispatch_decisions: Dict[job_id, node_ip]
++        # migration_decisions: List[Tuple[job_id, from_node_ip, to_node_ip]]
++        dispatch_decisions, migration_decisions = {}, []
++        try:
++             # Policy needs access to pending jobs too
++             dispatch_decisions, migration_decisions = self.scheduler_policy.schedule(
++                  active_jobs=active_jobs_snapshot,
++                  pending_jobs=pending_jobs_snapshot, # Pass pending queue snapshot
++                  nodes=worker_snapshot, # Pass worker info/status
++                  cluster_view=cluster_snapshot, # Pass resource view
++                  current_time=self.current_simulation_time # Pass time context
++             )
++        except Exception as e:
++             logger.error(f"Error during scheduling policy execution: {e}", exc_info=True)
++             return # Skip dispatch if policy fails
++
++        if dispatch_decisions: logger.debug(f"Dispatch decisions: {dispatch_decisions}")
++        if migration_decisions: logger.debug(f"Migration decisions: {migration_decisions}")
++
++        # 3. Execute Migration Decisions
++        if migration_decisions:
++             self._execute_migrations(migration_decisions, worker_snapshot)
++
++        # 4. Execute Dispatch Decisions (Launch new jobs)
++        if dispatch_decisions:
++             self._execute_dispatch(dispatch_decisions, worker_snapshot)
++
++
++    def get_pending_requests_snapshot(self) -> List[Dict[str, Any]]:
++         """Returns a list of pending job details for the scheduler."""
++         with self.request_lock:
++              # Return only the job_details dict part from the priority queue entries
++              # Sorting by priority/time might be useful for some policies
++              sorted_requests = sorted(self.pending_inference_requests, key=lambda x: (x[0], x[1]))
++              return [details for _, _, details in sorted_requests]
++
++
++    def _execute_migrations(self, migrations: List[Tuple[str, str, str]], workers: Dict[str, Any]):
++         """Initiates migration RPC calls based on policy decisions."""
++         with self.request_lock: # Protect worker_info status changes
++              for job_id, from_node_ip, to_node_ip in migrations:
++                   if from_node_ip not in workers or to_node_ip not in workers:
++                        logger.warning(f"Cannot migrate job {job_id}: Node(s) {from_node_ip} or {to_node_ip} not found.")
++                        continue
++
++                   # Check if nodes are in a state suitable for migration
++                   from_node_status = workers[from_node_ip].get("status", "active")
++                   to_node_status = workers[to_node_ip].get("status", "active")
++                   if from_node_status != "active" or to_node_status != "active":
++                        logger.warning(f"Skipping migration for job {job_id}: Node status conflict ({from_node_ip}:{from_node_status}, {to_node_ip}:{to_node_status})")
++                        continue
++
++                   # Get NMServer addresses
++                   from_node_port = workers[from_node_ip].get("port", self.node_manager_port)
++                   to_node_port = workers[to_node_ip].get("port", self.node_manager_port)
++                   from_nm_address = f"{from_node_ip}:{from_node_port}"
++                   to_nm_address = f"{to_node_ip}:{to_node_port}"
++
++                   logger.info(f"Initiating migration of job {job_id} from {from_nm_address} to {to_nm_address}")
++
++                   # Mark nodes as migrating in our state immediately
++                   self.worker_info[from_node_ip]["status"] = "migrating_from"
++                   self.worker_info[to_node_ip]["status"] = "migrating_to"
++                   self.cluster_state.update_node_status(from_node_ip, "migrating") # Adapt API
++                   self.cluster_state.update_node_status(to_node_ip, "migrating") # Adapt API
++
++                   # Send the InitiateMigration RPC to the source node
++                   success = self.comm_node_manager.initiate_migration(
++                        target_nm_address=from_nm_address, # Send to the source node
++                        job_id=job_id,
++                        target_node_ip=to_node_ip, # Tell source where to send state
++                        target_node_nm_address=to_nm_address
++                   )
++
++                   if not success:
++                        logger.error(f"Failed to send InitiateMigration RPC for job {job_id} to {from_nm_address}. Reverting status.")
++                        # Revert status if RPC call itself failed
++                        self.worker_info[from_node_ip]["status"] = "active"
++                        self.worker_info[to_node_ip]["status"] = "active"
++                        self.cluster_state.update_node_status(from_node_ip, "active")
++                        self.cluster_state.update_node_status(to_node_ip, "active")
++                   # Else: Migration is initiated, wait for MigrationComplete callback
++
++
++    def _execute_dispatch(self, dispatches: Dict[str, str], workers: Dict[str, Any]):
++         """Launches newly scheduled jobs via RPC calls."""
++         jobs_launched_this_round = set()
++         with self.request_lock: # Protect access to pending queue
++              # Use a temporary list to hold requests we attempt to dispatch
++              requests_to_remove = []
++              original_pending_count = len(self.pending_inference_requests)
++
++              # Iterate through pending requests (highest priority first)
++              temp_pending = sorted(self.pending_inference_requests, key=lambda x: (x[0], x[1]))
++              processed_indices = set()
++
++              for job_id, target_node_ip in dispatches.items():
++                   # Find the corresponding job details in the pending queue
++                   found = False
++                   for i, (prio, ts, details) in enumerate(temp_pending):
++                        if i in processed_indices: continue # Skip if already processed
++                        if details["job_id"] == job_id:
++                             found = True
++                             job_details = details
++                             queue_entry = (prio, ts, details)
++                             queue_index_in_original = -1
++                             # Find index in original heapq list (less efficient but needed for removal)
++                             try:
++                                  queue_index_in_original = self.pending_inference_requests.index(queue_entry)
++                             except ValueError:
++                                  logger.error(f"Consistency error: Job {job_id} from dispatch decision not found in live pending queue.")
++                                  continue # Skip this dispatch
++
++                             processed_indices.add(i) # Mark as processed in temp list
++
++                             if target_node_ip not in workers:
++                                  logger.warning(f"Cannot dispatch job {job_id}: Target node {target_node_ip} not found.")
++                                  continue # Try next dispatch
++
++                             node_port = workers[target_node_ip].get("port", self.node_manager_port)
++                             target_nm_address = f"{target_node_ip}:{node_port}"
++
++                             # Check node status before dispatching
++                             node_status = workers[target_node_ip].get("status", "active")
++                             if node_status != "active":
++                                 logger.warning(f"Skipping dispatch of job {job_id} to node {target_node_ip}: Status is '{node_status}'")
++                                 continue # Skip dispatch to non-active node
++
++
++                             logger.info(f"Dispatching job {job_id} (ReqID: {job_details['request_id']}) to {target_nm_address}")
++
++                             # Send LaunchJob RPC
++                             accepted = self.comm_node_manager.launch_job(
++                                  target_nm_address=target_nm_address,
++                                  job_id=job_id,
++                                  request_id=job_details["request_id"],
++                                  prompt=job_details["prompt"],
++                                  sampling_params=job_details["sampling_params"],
++                                  priority=job_details.get("priority", "normal")
++                             )
++
++                             if accepted:
++                                  logger.info(f"Node {target_node_ip} ACKed job {job_id}. Removing from pending queue.")
++                                  # Mark for removal from the actual queue
++                                  requests_to_remove.append(queue_entry)
++                                  jobs_launched_this_round.add(job_id)
++                                  # Update JobState and ClusterState
++                                  self.job_state.update_job_status(job_id, "running", location=target_node_ip) # Adapt API
++                                  self.cluster_state.allocate_resources(target_node_ip, job_id) # Adapt API
++                             else:
++                                  logger.warning(f"Node {target_node_ip} NAKed job {job_id}. Leaving in pending queue.")
++                                  # Job stays in the pending queue for the next round
++
++                             break # Move to the next dispatch decision
++                   if not found:
++                        logger.warning(f"Job {job_id} in dispatch decisions not found in pending list snapshot.")
++
++
++              # Remove successfully dispatched jobs from the actual pending queue
++              if requests_to_remove:
++                   # Efficient removal from list/heapq is tricky. Rebuild if needed.
++                   current_pending_set = set(self.pending_inference_requests)
++                   removed_set = set(requests_to_remove)
++                   self.pending_inference_requests = list(current_pending_set - removed_set)
++                   heapq.heapify(self.pending_inference_requests) # Restore heap property
++                   logger.debug(f"Removed {len(requests_to_remove)} jobs from pending queue. New size: {len(self.pending_inference_requests)}.")
++                   assert len(self.pending_inference_requests) == original_pending_count - len(requests_to_remove)
++
++
++
++    def _update_cluster_health(self):
++        """Checks for dead nodes based on last_seen time."""
++        cutoff_time = time.time() - getattr(self.args, "node_timeout_sec", 60) # Example timeout
++        dead_nodes = []
++        with self.request_lock: # Protect worker_info access
++             for ip, info in self.worker_info.items():
++                  # Only consider active nodes for timeout check
++                  if info.get("status", "active") == "active" and info.get("last_seen", 0) < cutoff_time:
++                       dead_nodes.append(ip)
++                       info["status"] = "inactive" # Mark as inactive
++
++        if dead_nodes:
++            logger.warning(f"Detected inactive/timed-out nodes: {dead_nodes}")
++            # Update cluster_state accordingly
++            for node_ip in dead_nodes:
++                 self.cluster_state.update_node_status(node_ip, "inactive") # Adapt API
++                 # TODO: Handle jobs that were running on the dead node (mark as failed?)
++                 failed_jobs = self.job_state.get_jobs_on_node(node_ip) # Adapt API
++                 for jid in failed_jobs:
++                      logger.warning(f"Marking job {jid} as failed due to node {node_ip} inactivity.")
++                      self.handle_job_completion(jid, False) # Mark as failed
++
++    def scheduler_loop(self):
++        """The main periodic scheduling loop."""
++        logger.info("BloxManager scheduler loop started.")
++        while not self.scheduler_run_signal.is_set():
++            start_time = time.time()
++            logger.debug("--- Scheduler Tick ---")
++            try:
++                # 1. Update cluster health (check for dead nodes)
++                self._update_cluster_health()
++
++                # 2. Run scheduling policy and dispatch decisions
++                self._run_schedule_and_dispatch()
++
++            except Exception as e:
++                logger.error(f"Error in scheduler loop iteration: {e}", exc_info=True)
++
++            # 3. Wait until the next interval
++            elapsed_time = time.time() - start_time
++            wait_time = max(0.01, self.scheduling_interval_sec - elapsed_time) # Ensure minimum wait
++            if elapsed_time > self.scheduling_interval_sec:
++                 logger.warning(f"Scheduler loop iteration took longer ({elapsed_time:.3f}s) than interval ({self.scheduling_interval_sec}s).")
++
++            # Wait for the calculated time or until shutdown signal
++            self.scheduler_run_signal.wait(timeout=wait_time)
++
++        logger.info("BloxManager scheduler loop stopped.")
++
++    def _run_schedule_and_dispatch(self):
++        """Performs one round of scheduling and dispatches decisions."""
++        self.current_simulation_time += self.scheduling_interval_sec
++
++        # 1. Get current state snapshots
++        active_jobs_snapshot = self.job_state.get_active_jobs()
++        pending_jobs_snapshot = self.get_pending_requests_snapshot()
++        cluster_snapshot = self.cluster_state.get_cluster_view()
++        # Use a read lock or be careful if iterating worker_info while RMServer might modify it
++        with self.request_lock:
++            worker_snapshot = copy.deepcopy(self.worker_info)
++
++        # 2. Call the scheduling policy
++        dispatch_decisions, migration_decisions, jobs_to_cancel = {}, [], set() # Initialize cancellation set
++        try:
++            dispatch_decisions, migration_decisions, jobs_to_cancel = self.scheduler_policy.schedule(
++                active_jobs=active_jobs_snapshot,
++                pending_jobs=pending_jobs_snapshot,
++                nodes=worker_snapshot,
++                cluster_view=cluster_snapshot,
++                current_time=self.current_simulation_time
+-    Marks the corresponding GPU in use for a given job ID
+-    Args:
+-        gpu_id_list : List of GPU ID's to terminate
+-        job_id: ID of the job to terminate
+-    """
+-    gpu_df.loc[gpu_df["GPU_ID"].isin(gpu_id_list), ["JOB_IDS", "IN_USE"]] = (
+-        job_id,
+-        True,
++        except Exception as e:
++            logger.error(f"Error during scheduling policy execution: {e}", exc_info=True)
++            return # Skip dispatch/migration/cancellation if policy fails
++
++        # --- Log Decisions ---
++        if dispatch_decisions: logger.debug(f"Dispatch decisions: {dispatch_decisions}")
++        if migration_decisions: logger.debug(f"Migration decisions: {migration_decisions}")
++        if jobs_to_cancel: logger.debug(f"Cancellation decisions: {jobs_to_cancel}")
++
++
++        # 3. Execute Cancellation Decisions FIRST (to potentially free resources)
++        if jobs_to_cancel:
++             self._execute_cancellations(jobs_to_cancel, active_jobs_snapshot, worker_snapshot)
++
++
++        # 4. Execute Migration Decisions
++        if migration_decisions:
++            # Filter out migrations for jobs that were just cancelled
++            valid_migrations = [(jid, fip, tip) for jid, fip, tip in migration_decisions if jid not in jobs_to_cancel]
++            if valid_migrations:
++                 self._execute_migrations(valid_migrations, worker_snapshot)
++
++
++        # 5. Execute Dispatch Decisions (Launch new jobs)
++        if dispatch_decisions:
++            # Filter out dispatches for jobs whose destination node might now be involved in migration
++            # (A simpler approach is to let the NM NAK the job if it's busy migrating)
++            self._execute_dispatch(dispatch_decisions, worker_snapshot)
++
++
++    def _execute_cancellations(self, jobs_to_cancel: Set[str], active_jobs: Dict[str, Any], workers: Dict[str, Any]):
++         """Sends termination requests for jobs identified by the scheduler."""
++         logger.info(f"Executing cancellations for {len(jobs_to_cancel)} jobs: {jobs_to_cancel}")
++         for job_id in jobs_to_cancel:
++              if job_id not in active_jobs:
++                   logger.warning(f"Cannot cancel job {job_id}: Not found in active jobs snapshot.")
++                   continue
++
++              node_ip = active_jobs[job_id].get("node_ip")
++              if not node_ip or node_ip not in workers:
++                   logger.warning(f"Cannot cancel job {job_id}: Node IP '{node_ip}' not found or invalid.")
++                   continue
++
++              node_port = workers[node_ip].get("port", self.node_manager_port)
++              target_nm_address = f"{node_ip}:{node_port}"
++
++              logger.info(f"Sending NotifyTerminate for job {job_id} to {target_nm_address}")
++              success = self.comm_node_manager.notify_terminate(
++                   target_nm_address=target_nm_address,
++                   job_id=job_id
++              )
++              if success:
++                   logger.info(f"NotifyTerminate for job {job_id} acknowledged by {target_nm_address}.")
++                   # Optionally update job state immediately to 'cancelling',
++                   # but rely on JobCompleted(success=False) callback for final state.
++                   # self.job_state.update_job_status(job_id, "cancelling")
++              else:
++                   logger.warning(f"NotifyTerminate for job {job_id} failed or was not acknowledged by {target_nm_address}.")
++
++
++
++    def run(self):
++        """Starts the RMServer and the main scheduler loop."""
++        # Start the RMServer gRPC service
++        self.grpc_server = rm_serve.start_server(self, self.scheduler_port)
++
++        # Start the scheduler loop in a separate thread
++        self.scheduler_thread = threading.Thread(target=self.scheduler_loop, daemon=True)
++        self.scheduler_thread.start()
++
++        logger.info("BloxManager running. Press Ctrl+C to exit.")
++        # Keep the main thread alive (e.g., wait for server termination)
++        try:
++            # self.grpc_server.wait_for_termination() # This blocks until server stops
++            # Or simply sleep while threads run
++            while True:
++                 time.sleep(3600)
++        except KeyboardInterrupt:
++            logger.info("Ctrl+C received, initiating BloxManager shutdown...")
++        finally:
++            # Graceful shutdown sequence
++            logger.info("Signaling scheduler loop to stop...")
++            self.scheduler_run_signal.set()
++            self.scheduler_thread.join(timeout=max(1, self.scheduling_interval_sec * 2)) # Wait for loop exit
++            if self.scheduler_thread.is_alive():
++                 logger.warning("Scheduler thread did not exit gracefully.")
++
++            logger.info("Stopping RMServer gRPC service...")
++            self.grpc_server.stop(grace=1).wait() # Wait for server stop
++            logger.info("RMServer stopped.")
++            logger.info("BloxManager shutdown complete.")
++
++
++# --- Argument Parsing for BloxManager ---
++def parse_blox_manager_args(parser: argparse.ArgumentParser):
++    parser.add_argument("--scheduler-port", type=int, default=50051, help="Port for the BloxManager RMServer")
++    parser.add_argument("--node-manager-port", type=int, default=50051, help="Default port Node Managers listen on")
++    parser.add_argument("--scheduling-interval", type=float, default=0.1, help="Scheduling loop interval in seconds")
++    parser.add_argument("--node-timeout-sec", type=int, default=60, help="Seconds of inactivity before marking a node dead")
++    parser.add_argument("--max-global-queue-size", type=int, default=1000, help="Maximum pending inference requests globally")
++
++    # Add policy choice (example based on "another output")
++    parser.add_argument("--policy", type=str, default="fifo", help="Global scheduling policy (e.g., fifo, llumnix)") # Add choices as policies are implemented
++    # Add policy-specific arguments here (e.g., --llumnix-preemption=True)
++    # parser.add_argument(...)
++
++    # Add paths for ClusterState/JobState config if needed
++    # parser.add_argument("--cluster-config", ...)
++    # parser.add_argument("--job-config", ...)
++
++    args = parser.parse_args()
++    return args
++
++# --- Main Execution ---
++if __name__ == "__main__":
++    args = parse_blox_manager_args(
++        argparse.ArgumentParser(description="Blox Central Scheduler for Inference")
+     )
++    try:
++        manager = BloxManager(args)
++        manager.run()
++    except ValueError as e:
++         logger.error(f"Initialization failed: {e}")
++    except Exception as e:
++         logger.error(f"BloxManager encountered critical error: {e}", exc_info=True)
+\ No newline at end of file
+diff --git a/blox/deployment/grpc_client_nm.py b/blox/deployment/grpc_client_nm.py
+index 2cf4c16..e6ff050 100644
+--- a/blox/deployment/grpc_client_nm.py
++++ b/blox/deployment/grpc_client_nm.py
+@@ -1,148 +1,160 @@
+-import os
+-import sys
+-import json
++# blox/deployment/grpc_client_nm.py
++
+ import grpc
+-import numa
++import json
+ import logging
+-import subprocess
+-import re
+-from concurrent import futures
++from typing import Dict, List, Tuple, Any
+ 
+-from typing import Optional
+-
+-sys.path.append(os.path.join(os.path.dirname(__file__), "grpc_stubs"))
+-import rm_pb2
+-import rm_pb2_grpc
++# Import the generated stubs for the Node Manager service
++from blox.deployment.grpc_proto import nm_pb2,nm_pb2_grpc, rm_pb2
+ 
++logger = logging.getLogger(__name__)
+ 
+ class NodeManagerComm(object):
+     """
+-    Node Manager communication class
++    gRPC Client used by BloxManager to send commands to Node Managers (NMServer).
++    Each method targets a specific Node Manager address.
+     """
+ 
+-    def __init__(self, ipaddr: str, central_scheduler_port: int) -> None:
++    # No __init__ needed, target address is provided per RPC call.
++
++    def launch_job(
++        self,
++        target_nm_address: str, # e.g., "10.0.0.5:50051"
++        job_id: str, # Blox Job ID (string)
++        request_id: str, # Original frontend request ID (string)
++        prompt: str,
++        sampling_params: Dict[str, Any], # Will be serialized to map<string, string>
++        priority: str
++    ) -> bool:
+         """
+-        Initializes Node Manager Communication module.
++        Sends LaunchJob RPC to a specific Node Manager to start an inference job.
++
+         Args:
+-         ipaddr: IP-address and the port for resource managers GRPC server.
+-                 Format - ip:port
++            target_nm_address: The "ip:port" address of the target Node Manager's gRPC server.
++            job_id: The unique ID assigned by BloxManager for this job.
++            request_id: The unique ID from the original frontend request.
++            prompt: The input prompt text.
++            sampling_params: Dictionary of sampling parameters. Values will be JSON encoded.
++            priority: Job priority string (e.g., "high", "normal").
++
++        Returns:
++            bool: True if the Node Manager ACKed the job (accepted it), False otherwise (NAKed or RPC error).
+         """
+-        self.ipaddr = f"{ipaddr}:{central_scheduler_port}"
+-        self.ip_extract = re.compile(".?inet ([0-9.]+)")
+-        self.memory_extract = re.compile(".?MemAvailable:\s+([0-9]+)")
++        # Serialize complex sampling_params values to JSON strings
++        try:
++            sampling_params_str_map = {str(k): json.dumps(v) for k, v in sampling_params.items()}
++        except TypeError as e:
++            logger.error(f"Failed to JSON-serialize sampling_params for job {job_id}: {e} - Params: {sampling_params}")
++            return False # Cannot proceed if params are not serializable
+ 
+-    def register_with_scheduler(
+-        self, interface: Optional[str] = None, nmipaddr: Optional[str] = None
+-    ) -> bool:
++        request = nm_pb2.LaunchJobRequest(
++            job_id=job_id,
++            request_id=request_id,
++            prompt=prompt,
++            sampling_params=sampling_params_str_map,
++            priority=priority,
++        )
++
++        logger.debug(f"Sending LaunchJob request for job {job_id} to {target_nm_address}")
++        try:
++            # Create a temporary channel for this specific call
++            with grpc.insecure_channel(target_nm_address) as channel:
++                stub = nm_pb2_grpc.NMServerStub(channel)
++                # Set a reasonable timeout (e.g., 10 seconds)
++                response = stub.LaunchJob(request, timeout=10)
++                logger.info(f"LaunchJob response for job {job_id} from {target_nm_address}: ACK={response.value}")
++                # Return the boolean ACK/NAK status from the Node Manager
++                return response.value
++        except grpc.RpcError as e:
++            # Log specific gRPC errors (e.g., UNAVAILABLE, DEADLINE_EXCEEDED)
++            status_code = e.code()
++            logger.error(f"gRPC error launching job {job_id} on {target_nm_address}: Status={status_code}, Details={e.details()}")
++            return False # Treat RPC error as NAK
++        except Exception as e:
++            # Catch other potential errors during the call
++            logger.error(f"Unexpected error launching job {job_id} on {target_nm_address}: {e}", exc_info=True)
++            return False
++
++    def initiate_migration(
++        self,
++        source_nm_address: str, # Address of the NM currently holding the job
++        job_id: str,            # Job to migrate
++        target_node_ip: str,    # IP address of the destination node
++        target_node_nm_address: str # Full "ip:port" of the destination NM server
++        ) -> bool:
+         """
+-        Register with worker based on calculated statistics
++        Sends InitiateMigration RPC to the source Node Manager to start migrating a job away.
++
+         Args:
+-            interface: The interface whose IP address we intend to use for
+-                       connecting to node manager.
+-            nmipaddr: Node Manager ipaddress to use
++            source_nm_address: "ip:port" of the Node Manager currently running the job.
++            job_id: The ID of the job to migrate.
++            target_node_ip: The IP address of the node where the job should be migrated to.
++            target_node_nm_address: The full "ip:port" of the Node Manager server on the target node.
++
+         Returns:
+-            bool
+-        Raises:
+-            ??
++            bool: True if the source Node Manager acknowledged the migration initiation request, False otherwise.
++                  Note: This only acknowledges the request; actual migration happens asynchronously.
++        """
++        request = nm_pb2.MigrationRequest(
++            job_id=job_id,
++            target_node=target_node_ip,
++            target_address=target_node_nm_address
++        )
++        logger.debug(f"Sending InitiateMigration for job {job_id} to source node {source_nm_address} (Target: {target_node_nm_address})")
++        try:
++            with grpc.insecure_channel(source_nm_address) as channel:
++                stub = nm_pb2_grpc.NMServerStub(channel)
++                # Timeout for acknowledging the initiation request
++                response = stub.InitiateMigration(request, timeout=10)
++                logger.info(f"InitiateMigration response for job {job_id} from {source_nm_address}: Success={response.value}")
++                # Return whether the source node accepted the request to start migrating
++                return response.value
++        except grpc.RpcError as e:
++            status_code = e.code()
++            logger.error(f"gRPC error initiating migration for job {job_id} on {source_nm_address}: Status={status_code}, Details={e.details()}")
++            return False
++        except Exception as e:
++            logger.error(f"Unexpected error initiating migration for job {job_id} on {source_nm_address}: {e}", exc_info=True)
++            return False
++
++    def notify_terminate(self, target_nm_address: str, job_id: str) -> bool:
+         """
++        Sends NotifyTerminate RPC to a specific Node Manager to request cancellation
++        of a running inference job.
++
++        Args:
++            target_nm_address: The "ip:port" address of the Node Manager running the job.
++            job_id: The ID of the job to terminate/cancel.
++
++        Returns:
++            bool: True if the Node Manager acknowledged the termination request, False otherwise.
++                  Note: This only acknowledges the request; actual cancellation might take time.
++        """
++        # Ensure you have defined TerminateJobRequest in your nm.proto
++        request = nm_pb2.TerminateJobRequest(job_id=job_id)
++
++        logger.debug(f"Sending NotifyTerminate request for job {job_id} to {target_nm_address}")
++        try:
++            with grpc.insecure_channel(target_nm_address) as channel:
++                stub = nm_pb2_grpc.NMServerStub(channel)
++                # Timeout for acknowledging the termination request
++                response = stub.NotifyTerminate(request, timeout=10)
++                logger.info(f"NotifyTerminate response for job {job_id} from {target_nm_address}: Acknowledged={response.value}")
++                # Return whether the node acknowledged the cancellation request
++                return response.value
++        except grpc.RpcError as e:
++            status_code = e.code()
++            # Don't log error if the job is already gone (NOT_FOUND)
++            if status_code == grpc.StatusCode.NOT_FOUND:
++                 logger.warning(f"NotifyTerminate for job {job_id} failed on {target_nm_address}: Job not found (likely already completed).")
++                 return False # Or True, as the goal (job gone) is achieved? False is safer.
++            else:
++                 logger.error(f"gRPC error terminating job {job_id} on {target_nm_address}: Status={status_code}, Details={e.details()}")
++                 return False
++        except Exception as e:
++            logger.error(f"Unexpected error terminating job {job_id} on {target_nm_address}: {e}", exc_info=True)
++            return False
++
++    # --- Other potential methods (if needed) ---
++    # e.g., querying node status, updating leases (if using training features)
+\ No newline at end of file
+diff --git a/blox/deployment/grpc_client_rm.py b/blox/deployment/grpc_client_rm.py
+index 2593fea..0a792b5 100644
+--- a/blox/deployment/grpc_client_rm.py
++++ b/blox/deployment/grpc_client_rm.py
+@@ -1,297 +1,127 @@
+-import os
+-import sys
+-import json
+ import grpc
++import json
++import uuid
+ import logging
+-from typing import List
+-from concurrent import futures
+-from collections import defaultdict
+-
+-sys.path.append(os.path.join((__file__), "./grpc_stubs"))
+-import nm_pb2
+-import nm_pb2_grpc
+-
+-import rm_pb2
++from typing import Dict, Any, Tuple, Optional, List
+ 
+-import simulator_pb2
+-import simulator_pb2_grpc
++# Import the generated stubs
++from blox.deployment.grpc_proto import rm_pb2
++from blox.deployment.grpc_proto import rm_pb2_grpc
+ 
++logger = logging.getLogger(__name__)
+ 
+ class ResourceManagerComm(object):
+-    """
+-    Resource Manager communication class
+-    """
+-
+-    def __init__(self, node_manager_port) -> None:
+-        self.rpc_port = node_manager_port
+-        return None
+-
+-    def launch_job(
+-        self,
+-        job_id: int,
+-        job_description: dict,
+-        local_gpu_ids: List[int],
+-        ipaddr_list: List[str],
+-    ) -> None:
+-        """
+-        Notify respesctive node managers to launch jobs.
+-        For each job this is called once.
+-        Args:
+-            job_description: Job description from the job ID dictionary
+-            gpu_ids: Number of GPUS to launch
+-            ipaddr : list of IP address to contact node manager
+-        Returns:
+-            None
+-        """
+-        dist_rank = 0
+-        world_size = len(local_gpu_ids)
+-        if job_description["simulation"] == False:
+-            for ipaddr, lgid in zip(ipaddr_list, local_gpu_ids):
+-                if dist_rank == 0:
+-                    master_ip_address = ipaddr
+-                ipaddr = f"{ipaddr}:{self.rpc_port}"
+-                launch_dict = dict()
+-                launch_dict["job_id"] = job_id
+-                # if job_id == 2:
+-                # import ipdb
+-
+-                # ipdb.set_trace()
+-                launch_dict["local_GPU_ID"] = lgid
+-                if "launch_command" not in job_description:
+-                    raise Exception("Missing Launch Command")
+-                launch_dict["launch_command"] = job_description["launch_command"]
+-                if "suspended" in job_description:
+-                    launch_dict["should_resume"] = job_description["suspended"]
+-                else:
+-                    launch_dict["should_resume"] = "0"
+-
+-                # we have simplified this
+-
+-                launch_params = list()
+-                launch_params.append(lgid)
+-                launch_params.append(master_ip_address)
+-                launch_params.append(world_size)
+-                launch_params.append(dist_rank)
+-                launch_params.extend(job_description["launch_params"])
+-                launch_params.append(str(launch_dict["job_id"]))
+-                # launch_params_string = ",".join(launch_params)
+-
+-                # sending parameters for launch params
+-                environment_variable_pairs = dict()
+-                environment_variable_pairs["local_gpu_id"] = str(lgid)
+-                environment_variable_pairs["master_ip_address"] = master_ip_address
+-                environment_variable_pairs["world_size"] = str(world_size)
+-                environment_variable_pairs["dist_rank"] = str(dist_rank)
+-                environment_variable_pairs["job_id"] = str(launch_dict["job_id"])
+-                environment_variable_pairs["local_accessible_gpus"] = ",".join(
+-                    [str(x) for x in local_gpu_ids]
+-                )
+-                launch_dict["env_variables"] = environment_variable_pairs
+-                launch_dict["launch_params"] = launch_params
+-                print("Launch Params {}".format(launch_params))
+-                # ["0,", "6001", "1", "resnet50", "64" ]
+-                launch_request = rm_pb2.JsonResponse()
+-                launch_request.response = json.dumps(launch_dict)
+-                with grpc.insecure_channel(ipaddr) as channel:
+-                    stub = nm_pb2_grpc.NMServerStub(channel)
+-                    response = stub.LaunchJob(launch_request)
+-                print(
+-                    f"Launched Job {job_id}, response {response}, request {launch_dict}"
+-                )
+-                dist_rank += 1
+-
+-            return None
+-        elif job_description["simulation"] == True:
+-            # TODO: Add time for checkpoint and restore
+-            return None
+-
+-    def terminate_jobs(
+-        self,
+-        job_id_list: List[int],
+-        terminate_rank_0_ipaddr: List[int],
+-        all_ipaddr_list: List[List[str]],
+-        terminate_simulation: List[bool],
+-    ) -> None:
+-        """
+-        Given a list of Job_ID's and their corresponding ip addresses.
+-        Terminate these jobs.
+-        Args:
+-            job_id: list of job ids to terminate
+-            ipaddr: list of corresponding ip addresses
+-            terminate_simulation : whether job is simulation or not
+-        Returns:
+-            None
+-        """
+-        # TODO: Multithread this
+-        print("In terminate simulation")
+-        print("job id list {}".format(job_id_list))
+-        assert len(job_id_list) == len(terminate_simulation)
+-        assert len(job_id_list) == len(terminate_rank_0_ipaddr)
+-        assert len(job_id_list) == len(all_ipaddr_list)
+-
+-        send_request_dict = defaultdict(list)
+-        other_ip_address_to_send = defaultdict(list)
+-        for job_id, rank_0_ipaddr, all_ip_addr, simulation in zip(
+-            job_id_list, terminate_rank_0_ipaddr, all_ipaddr_list, terminate_simulation
+-        ):
+-
+-            if not simulation:
+-                all_ip_addr = [f"{all_ip}:{self.rpc_port}" for all_ip in all_ip_addr]
++    """gRPC Client used by Node Managers and Frontend to communicate with BloxManager."""
+ 
+-                for send_ip_address in all_ip_addr:
+-                    # ipaddr = f"{send_ip_address}:{self.rpc_port}"
+-                    send_request_dict[send_ip_address].append(job_id)
+-                    other_ip_address_to_send[send_ip_address].append(all_ip_addr)
++    def __init__(self, rm_address: str): # Address of the RMServer (BloxManager)
++        self.rm_addr = rm_address
++        logger.info(f"ResourceManagerComm initialized for RM address: {self.rm_addr}")
+ 
+-        for send_ip_address in send_request_dict:
+-            terminate_request = rm_pb2.JsonResponse()
++    # --- Methods used by NodeManager ---
+ 
+-            terminate_request.response = json.dumps(
+-                {
+-                    "Job_ID_list": send_request_dict[send_ip_address],
+-                    "IP_addr_terminate": other_ip_address_to_send[send_ip_address],
+-                }
+-            )
+-            # TODO: Add simulator
+-
+-            print("Called Terminate for ip address {}".format(send_ip_address))
+-            print("Terminating job ids {}".format(send_request_dict[send_ip_address]))
+-            print(
+-                "IP_addr_terminate {}".format(other_ip_address_to_send[send_ip_address])
+-            )
+-
+-            with grpc.insecure_channel(send_ip_address) as channel:
+-                stub = nm_pb2_grpc.NMServerStub(channel)
+-                response = stub.TerminateJob(terminate_request)
+-        return None
+-
+-    def get_metrics(
++    def register_with_scheduler(
+         self,
+-        job_id_list: List[int],
+-        ipaddr_list: List[str],
+-        if_simulation: List[bool],
+-        round_duration: int,
+-        active_job_dict: dict,
+-    ) -> dict:
++        node_ipaddr: str,
++        node_interface: str,
++        num_gpus: int,
++        node_manager_port: int,
++        available_kv_memory_gb: int = 0, # Optional reporting
++        supported_models: Optional[List[str]] = None
++    ) -> bool:
++        """Register the node manager with the central scheduler (BloxManager)."""
++        models_to_send = supported_models if supported_models else []
++        request = rm_pb2.RegisterRequest(
++            ipaddr=node_ipaddr,
++            interface=node_interface,
++            num_gpus=num_gpus,
++            node_manager_port=node_manager_port, # Tell RM how to reach back
++            available_kv_memory_gb=available_kv_memory_gb,
++            supported_models=models_to_send
++        )
++        logger.debug(f"Sending RegisterWorker request for node {node_ipaddr} to {self.rm_addr}")
++        try:
++            with grpc.insecure_channel(self.rm_addr) as channel:
++                stub = rm_pb2_grpc.RMServerStub(channel)
++                response = stub.RegisterWorker(request, timeout=10)
++            logger.info(f"RegisterWorker response from {self.rm_addr}: Success={response.value}")
++            return response.value
++        except grpc.RpcError as e:
++            logger.error(f"gRPC error registering worker {node_ipaddr} with {self.rm_addr}: {e}")
++            return False
++        except Exception as e:
++            logger.error(f"Unexpected error registering worker {node_ipaddr}: {e}", exc_info=True)
++            return False
++
++    def notify_job_done(self, job_id: str, success: bool) -> bool:
++        """Tell the scheduler (BloxManager) that an inference job has finished."""
++        req = rm_pb2.JobDoneRequest(job_id=job_id, success=success)
++        logger.debug(f"Sending JobCompleted notification for job {job_id} to {self.rm_addr} (Success: {success})")
++        try:
++            with grpc.insecure_channel(self.rm_addr) as ch:
++                stub = rm_pb2_grpc.RMServerStub(ch)
++                resp = stub.JobCompleted(req, timeout=10)
++            # RMServer should always return true if it received the message
++            return resp.value
++        except grpc.RpcError as e:
++            logger.error(f"gRPC error sending job completion for {job_id} to {self.rm_addr}: {e}")
++            return False # Indicate notification failed
++        except Exception as e:
++             logger.error(f"Unexpected error sending job completion for {job_id}: {e}", exc_info=True)
++             return False
++
++    def migration_complete(self, report: rm_pb2.MigrationReport) -> bool:
++        """Tell the scheduler (BloxManager) that a migration finished."""
++        logger.debug(f"Sending MigrationComplete report for job {report.job_id} to {self.rm_addr}")
++        try:
++            with grpc.insecure_channel(self.rm_addr) as ch:
++                 stub = rm_pb2_grpc.RMServerStub(ch)
++                 resp = stub.MigrationComplete(report, timeout=10)
++            return resp.value
++        except grpc.RpcError as e:
++            logger.error(f"gRPC error sending migration completion for {report.job_id}: {e}")
++            return False
++        except Exception as e:
++             logger.error(f"Unexpected error sending migration completion for {report.job_id}: {e}", exc_info=True)
++             return False
++
++
++    # --- Methods used by Frontend ---
++
++    def submit_inference(self,
++                         prompt: str,
++                         sampling_params: Dict[str, Any],
++                         priority: str = "normal",
++                         target_model: Optional[str] = None,
++                         max_latency_ms: float = 0.0 # 0 means no specific SLO
++                        ) -> Tuple[bool, Optional[str], str]:
+         """
+-        Given a job ID list fetch metrics from all the node managers
+-        job_id_list : List of Job ID's
+-        ipaddr_list : List of corresponding Job ID's
+-        if_simulation: List of boolean telling if the job is simulation or not
+-        round_duration: Represents the round duration
+-        active_job_dict: Active jobs dictionary
+-        #CAUTION: In case simulation we modify some of the parameters in place.
++        Submits an inference request from the frontend to the BloxManager.
++        Returns (accepted: bool, job_id: Optional[str], message: str)
+         """
+-        # TODO: Multi-thread this
+-        metric_data_dict = dict()
+-        for idx, job_id in enumerate(job_id_list):
+-            ipaddr_to_query = ipaddr_list[idx]
+-            if_sim = if_simulation[idx]
+-            job_exit = False
+-            if not if_sim:
+-                # added tracking
+-                previous_metric = active_job_dict[job_id]["tracked_metrics"]
+-                metric_data_dict[job_id] = previous_metrics
+-                for ipaddr in ipaddr_to_query:
+-                    ipaddr = f"{ipaddr}:{self.rpc_port}"
+-                    metric_request = rm_pb2.JsonResponse()
+-                    metric_request.response = json.dumps({"Job_ID": job_id})
+-                    with grpc.insecure_channel(ipaddr) as channel:
+-                        stub = nm_pb2_grpc.NMServerStub(channel)
+-                        response = stub.GetMetrics(metric_request)
+-                    metric_data = json.loads(response.response)
+-                    # make sure we update and not overwrite
+-                    if job_id in metric_data_dict:
+-                        for key in metric_data:
+-                            if key == "attained_service":
+-                                metric_data_dict[job_id][key] += metric_data[key]
+-                            if key == "per_iter_time":
+-                                # average key
+-                                if key in metric_data_dict[job_id]:
+-                                    metric_data_dict[job_id][key] = (
+-                                        metric_data_dict[job_id][key] + metric_data[key]
+-                                    ) / 2
+-                                else:
+-                                    pass
+-                            if key == "iter_num":
+-                                metric_data_dict[job_id][key] += metric_data[key]
+-
+-                    else:
+-                        metric_data_dict[job_id] = metric_data
+-
+-                    # Add previous data
+-                    print(
+-                        "Job id {} Aggregated Metric Data {}".format(
+-                            job_id, metric_data
+-                        )
+-                    )
+-                    # Same job ids can be running at multiple ip addr
+-            else:
+-                # this is a simulation
+-                # profile scaling by number of GPUs
+-                # total_gpus = [5, 3, 1.4, 1.2, 1.1, 1.0, 1.0, 1.0, 1.0]
+-                # self.optimus_scale_by_gpus = {
+-                # "1.0": total_gpus[0],
+-                # "2.0": total_gpus[1],
+-                # "3.0": total_gpus[2],
+-                # "4.0": total_gpus[3],
+-                # "5.0": total_gpus[4],
+-                # "6.0": total_gpus[5],
+-                # "7.0": total_gpus[6],
+-                # "8.0": total_gpus[7],
+-                # "9.0": total_gpus[8],
+-                # }
+-                if active_job_dict[job_id]["previously_launched"] == False:
+-                    active_job_dict[job_id]["job_launched_first_time"] = True
+-                if active_job_dict[job_id]["previously_launched"] == True:
+-                    active_job_dict[job_id]["job_launched_first_time"] = False
+-
+-                active_job_dict[job_id]["previously_launched"] = True
+-
+-                total_iterations_in_round = (
+-                    round_duration / active_job_dict[job_id]["job_iteration_time"]
+-                )
+-                attained_service = (
+-                    active_job_dict[job_id]["tracked_metrics"]["attained_service"]
+-                    + round_duration
+-                )
+-
+-                per_iteration_time = active_job_dict[job_id]["job_iteration_time"]
+-
+-                total_iteration_achieved = (
+-                    total_iterations_in_round
+-                    + active_job_dict[job_id]["job_executed_iteration"]
+-                )
+-                if os.environ["sched_policy"] == "Optimus":
+-                    total_iteration_achieved = (
+-                        total_iterations_in_round
+-                        * self.optimus_scale_by_gpus[
+-                            active_job_dict[job_id]["total_gpus"]
+-                        ]
+-                        + active_job_dict[job_id]["job_executed_iteration"]
+-                    )
+-                if (
+-                    total_iteration_achieved
+-                    >= active_job_dict[job_id]["job_total_iteration"]
+-                ):
+-                    job_exit = True
+-
+-                # CAUTION: In place update
+-                # TODO: Clean this part of update
+-                active_job_dict[job_id][
+-                    "job_executed_iteration"
+-                ] = total_iteration_achieved
+-
+-                if job_exit == True:
+-                    metric_data_dict[job_id] = {
+-                        "attained_service": attained_service,
+-                        "per_iter_time": per_iteration_time,
+-                        "job_exit": True,
+-                    }
+-                if not job_exit:
+-                    metric_data_dict[job_id] = {
+-                        "attained_service": attained_service,
+-                        "per_iter_time": per_iteration_time,
+-                    }
+-
+-        return metric_data_dict
++        # Generate a unique ID for this specific request attempt
++        request_id = str(uuid.uuid4())
++        # Serialize sampling params
++        sampling_params_str_map = {str(k): json.dumps(v) for k, v in sampling_params.items()}
++
++        req = rm_pb2.InferenceRequest(
++            request_id=request_id,
++            prompt=prompt,
++            sampling_params=sampling_params_str_map,
++            priority=priority,
++            target_model=target_model if target_model else "",
++            max_latency_ms=max_latency_ms
++        )
++        logger.debug(f"Sending SubmitInferenceRequest (ReqID: {request_id}) to {self.rm_addr}")
++        try:
++            with grpc.insecure_channel(self.rm_addr) as ch:
++                stub = rm_pb2_grpc.RMServerStub(ch)
++                resp = stub.SubmitInferenceRequest(req, timeout=10)
++            logger.info(f"SubmitInferenceRequest response for ReqID {request_id}: Accepted={resp.accepted}, JobID={resp.job_id}, Msg={resp.message}")
++            # Return acceptance status, the Blox job_id assigned, and any message
++            return resp.accepted, resp.job_id if resp.accepted else None, resp.message
++        except grpc.RpcError as e:
++            logger.error(f"gRPC error submitting inference request {request_id} to {self.rm_addr}: {e}")
++            return False, None, f"RPC Error: {e.details()}"
++        except Exception as e:
++            logger.error(f"Unexpected error submitting inference request {request_id}: {e}", exc_info=True)
++            return False, None, f"Client-side Error: {e}"
+\ No newline at end of file
+diff --git a/blox/deployment/grpc_proto/nm.proto b/blox/deployment/grpc_proto/nm.proto
+index c3eab30..e20a53f 100644
+--- a/blox/deployment/grpc_proto/nm.proto
++++ b/blox/deployment/grpc_proto/nm.proto
+@@ -1,15 +1,36 @@
+ syntax = "proto3";
+-
+ import "rm.proto";
+ 
+ service NMServer {
+-  rpc LaunchJob(JsonResponse) returns(BooleanResponse) {}
+-  rpc TerminateJob(JsonResponse) returns(BooleanResponse) {}
+-  rpc TerminateJobfromPeer(JsonResponse) returns(BooleanResponse) {}
+-  rpc GetMetrics(JsonResponse) returns (JsonResponse) {}
+-  rpc SetMetrics(JsonResponse) returns (BooleanResponse) {}
+-  rpc GetLease(JsonResponse) returns (BooleanResponse) {}
+-  rpc NotifyTerminate(IntVal) returns (BooleanResponse) {}
+-  
++    rpc LaunchJob(LaunchJobRequest) returns (BooleanResponse) {} // Modified to be explicit
++    rpc TerminateJob(JsonResponse) returns(BooleanResponse) {}
++    rpc TerminateJobfromPeer(JsonResponse) returns(BooleanResponse) {}
++    rpc GetMetrics(JsonResponse) returns (JsonResponse) {}
++    rpc SetMetrics(JsonResponse) returns (BooleanResponse) {}
++    rpc GetLease(JsonResponse) returns (BooleanResponse) {}
++    rpc NotifyTerminate(IntVal) returns (BooleanResponse) {}
++    
++    // ----- migration APIs ----- 
++    rpc InitiateMigration(MigrationRequest) returns (BooleanResponse) {}
++    rpc ReceiveMigration(MigrationState)  returns (BooleanResponse) {}
++}
++
++// --- Modified for Inference ---
++message LaunchJobRequest {
++    string job_id = 1;
++    string request_id = 2;
++    string prompt = 3;
++    map<string, string> sampling_params = 4;
++    string priority = 5;
++}
++
++message MigrationRequest {
++  string job_id        = 1;
++  string target_node   = 2;
++  string target_address= 3;
+ }
+ 
++message MigrationState {
++  string job_id   = 1;
++  bytes  state_blob = 2;
++}
+\ No newline at end of file
+diff --git a/blox/deployment/grpc_proto/rm.proto b/blox/deployment/grpc_proto/rm.proto
+index 513ee50..eaf382e 100644
+--- a/blox/deployment/grpc_proto/rm.proto
++++ b/blox/deployment/grpc_proto/rm.proto
+@@ -1,33 +1,68 @@
+ syntax = "proto3";
+ 
+ service RMServer {
+-  // Node Manager calls registers with resource manager
+-  rpc RegisterWorker(RegisterRequest) returns(BooleanResponse) {}
+-  rpc AcceptJob(JsonResponse) returns (BooleanResponse) {}
+-  rpc ReturnTime(EmptyMsg) returns (IntVal) {}
++    // Node Manager calls registers with resource manager
++    rpc RegisterWorker(RegisterRequest) returns(BooleanResponse) {}
++    rpc AcceptJob(JsonResponse) returns (BooleanResponse) {} // Potentially rename/refactor for clarity? LaunchTrainingJob?
++    rpc ReturnTime(EmptyMsg) returns (IntVal) {}
++
++    // node → global notifications
++    rpc JobCompleted(JobDoneRequest)    returns (BooleanResponse) {}
++    rpc MigrationComplete(MigrationReport) returns (BooleanResponse) {} // Keep if migration is needed
++
++    rpc SubmitInferenceRequest(InferenceRequest) returns (InferenceResponse) {} // Frontend -> Scheduler
+ }
+ 
+-// string which directly allows us to return a JSON
+ message JsonResponse{
+-  string response = 1;
++    string response = 1;
+ }
+ 
+-message RegisterRequest{
+-  string ipaddr = 1;
+-  int32 numGPUs = 2;
+-  int32 numCPUcores =3;
+-  int32 memoryCapacity =4;
+-  bool numaAvailable = 5;
+-  map <int32, int32> cpuMaping = 6;
+-  string gpuUUIDs = 7;
++message RegisterRequest {
++    string ipaddr = 1;
++    string interface = 2;
++    // Optional: Add inference capabilities reporting
++    int32 num_gpus = 3; // Report number of GPUs
++    int64 available_kv_memory_gb = 4;
++    repeated string supported_models = 5;
++    int32 node_manager_port = 6; // Port NMServer is listening on
+ }
+ 
+ message BooleanResponse{
+-  bool value = 1;
++    bool value = 1;
+ }
+ 
+ message IntVal{
+-  int32 value = 1;
++    int32 value = 1;
+ }
+ 
+ message EmptyMsg{}
++
++message JobDoneRequest {
++  string job_id = 1;
++  bool success = 2;
++  // Add output/metrics if needed by scheduler
++  string output_summary = 3;
++  float time_taken = 4;
++}
++
++message MigrationReport {
++  string job_id      = 1;
++  string from_node   = 2;
++  string to_node     = 3;
++}
++
++message InferenceRequest {
++    string request_id = 1;
++    string prompt = 2;
++    map<string, string> sampling_params = 3;
++    string priority = 4; // e.g., "high", "normal"
++    // constraints like target model, latency SLOs etc.
++    string target_model = 5;
++    float max_latency_ms = 6;
++}
++
++message InferenceResponse {
++    string job_id = 1; // The ID assigned by Blox if accepted
++    bool accepted = 2;
++    string message = 3; // e.g., "Request queued" or "Rejected: overloaded"
++}
+diff --git a/blox/deployment/grpc_server_nm.py b/blox/deployment/grpc_server_nm.py
+index bf8bf8f..bcf2786 100644
+--- a/blox/deployment/grpc_server_nm.py
++++ b/blox/deployment/grpc_server_nm.py
+@@ -1,303 +1,132 @@
+-import os
+-import sys
+-import time
+-import json
+ import grpc
+-import copy
++import json
+ import logging
+-import subprocess
+-import pandas as pd
++from typing import Dict, Any, Optional, Tuple
+ from concurrent import futures
+ 
+-from typing import Tuple
+-
+-# sys.path.append(os.path.join(os.path.dirname(__file__), "grpc_stubs"))
+-sys.path.append(os.path.join(os.path.dirname(__file__), "grpc_stubs"))
+-sys.path.append(os.path.dirname(__file__))
+-print(sys.path)
+-import nm_pb2 as nm_pb2
+-import rm_pb2 as rm_pb2
+-import nm_pb2_grpc as nm_pb2_grpc
++# Import the generated stubs
++from blox.deployment.grpc_proto import nm_pb2,nm_pb2_grpc, rm_pb2
+ 
+-from node_data_relay import DataRelay
+-
+-from google.protobuf.json_format import MessageToDict
++# Type hint for NodeManagerMain to avoid circular import
++from typing import TYPE_CHECKING
++if TYPE_CHECKING:
++    from node_manager import NodeManagerMain
+ 
++logger = logging.getLogger(__name__)
+ 
+ class NMServer(nm_pb2_grpc.NMServerServicer):
+-    def __init__(self, use_redis, redis_host, redis_port):
+-        self.job_mapping = dict()  # Job ID to GPU mapping
+-        # if use_redis:
+-        # configuring local data store with redis
+-        self.local_data_store = DataRelay(
+-            use_redis=use_redis, redis_host=redis_host, redis_port=redis_port
+-        )
+-
+-        # Will keep job terminate ids in this list
+-        # else:
+-        # # configuring local data store with python dict
+-        # self.local_data_store = DataRelay()
+-
+-    def ensure_terminate_status(self):
+-        """
+-        Check if all jobs in the terminate list have terminated before finishing the launch.
+-        """
+-        print("Ensuring previous round has terminated")
+-        jid_to_test = self.local_data_store.get_job_ids_to_check_terminate()
+-        while jid_to_test is not None:
+-            job_status = self.local_data_store.get_job_status(jid_to_test)
+-            while job_status != "exit":
+-                time.sleep(1)
+-                job_status = self.local_data_store.get_job_status(jid_to_test)
+-            out_val = self.local_data_store.push_terminated_jobs(jid_to_test)
+-            jid_to_test = self.local_data_store.get_job_ids_to_check_terminate()
+-        # all workers are done with checking if each individual job has finished.
+-
+-        # now we need to make sure all jobs have been finished
+-        # this involves combining two lists
+-
+-        # terminated_job_lists = self.local_data_store.get_terminated_jobs()
+-        # all_job_to_terminate = self.local_data_store.get_jobs_to_terminate()
+-
+-        # time to check if elements are all there
+-        all_terminated = False
+-
+-        while not all_terminated:
+-            all_terminated = True
+-            jid_to_test = self.local_data_store.get_job_ids_to_check_terminate()
+-            while jid_to_test is not None:
+-                job_status = self.local_data_store.get_job_status(jid_to_test)
+-                while job_status != "exit":
+-                    time.sleep(1)
+-                    job_status = self.local_data_store.get_job_status(jid_to_test)
+-                out_val = self.local_data_store.push_terminated_jobs(jid_to_test)
+-                jid_to_test = self.local_data_store.get_job_ids_to_check_terminate()
+-            terminated_job_lists = self.local_data_store.get_terminated_jobs()
+-            all_job_to_terminate = self.local_data_store.get_jobs_to_terminate()
+-            print("Terminated job list {}".format(terminated_job_list))
+-            print("All jobs to terminate {}".format(all_job_to_terminate))
+-            for terminate_id in all_job_to_terminate:
+-                if terminate_id not in terminated_job_lists:
+-                    all_terminated = False
+-                    time.sleep(1)
+-        print("All jobs terminated")
+-
+-        return None
+-
+-        # if len(self.job_terminate_ids) > 0:
+-        # while len(self.job_terminate_ids) > 0:
+-        # jid_to_test = self.job_terminate_ids.pop()
+-        # job_status = self.local_data_store.get_job_status(jid_to_test)
+-        # while job_status != "exit":
+-        # time.sleep(1)
+-        # job_status = self.local_data_store.get_job_status(jid_to_test)
+-
+-    def LaunchJob(self, request, context) -> rm_pb2.BooleanResponse:
+-        """
+-        Receives information for launching jobs on the node manager
+-        """
+-        # TODO: Add launching from docker
+-        print("In Launch Job")
+-        received_job = json.loads(request.response)
+-        command_to_run = received_job["launch_command"]
+-        launch_params = received_job["launch_params"]
+-        local_gpu_id = received_job["local_GPU_ID"]
+-        # resume_iter = received_job["resume_iter"]
+-        resume_iter = 0
+-        job_id = received_job["job_id"]
+-        environment_variable_pairs = received_job["env_variables"]
+-
+-        # check if all previous jobs have terminated
+-        self.ensure_terminate_status()
+-        self.local_data_store.set_lease_status(received_job["job_id"], True)
+-        self.local_data_store.set_lease_status_rank0(received_job["job_id"], [], True)
+-        self.local_data_store.set_job_status(received_job["job_id"], "running")
+-        # os.environ["BLOX_JOB_ID"] = str(received_job["job_id"])
+-        # os.environ["GPU_ID"] = str(received_job["local_GPU_ID"])
+-        # os.environ["BLOX_LOG_DIR"] = "temp"
+-        # os.environ["SHOULD_RESUME"] = str(received_job["should_resume"])
+-        # os.environ["START_ITER"] = "0"
+-        # BloxIterator saves the checkpoint in the format {jobid_iternum.ckpt}
+-        # TODO: Support Model Parallel/Pipeline Parallel job checkpoints
+-        print("Launching Command")
+-        print(
+-            f"{command_to_run}  {' '.join(str(i) for i in launch_params)}  2>&1 | tee /dev/shm/job_{job_id}_local_gpu_{local_gpu_id}.log"
+-        )
+-        print("Environment variable pair {}".format(environment_variable_pairs))
+-        proc = subprocess.Popen(
+-            f"{command_to_run}  {' '.join(str(i) for i in launch_params)}  2>&1 | tee /dev/shm/job_{job_id}_local_gpu_{local_gpu_id}.log",
+-            stdout=subprocess.DEVNULL,
+-            stderr=subprocess.DEVNULL,
+-            start_new_session=True,
+-            shell=True,
+-            env=environment_variable_pairs,
+-        )
+-        # with open("job_file_db.txt", "w") as fopen:
+-        # fopen.write(
+-        # f"{command_to_run}  {' '.join(str(i) for i in launch_params)}  2>&1 | tee /dev/shm/job_{job_id}_local_gpu_{local_gpu_id}.log"
+-        # )
+-        # Debug code added
+-        # output, error = proc.communicate()
+-        # print(output, error)
+-        print(f"received_job {received_job}, node manager")
+-        return rm_pb2.BooleanResponse(value=True)
+-
+-    def TerminateJob(self, request, context) -> rm_pb2.BooleanResponse:
+-        """
+-        This is called from Rank 0
+-        Terminate Job post launch. This will terminate lease. Which when read
+-        by blox iterator will terminate the job.
+-        This is has been called by the node manager
+-        """
+-        print("Called Terminate")
+-        all_job_ids_to_terminate = json.loads(request.response)["Job_ID_list"]
+-        all_corresponding_ip_address_to_terminate = json.loads(request.response)[
+-            "IP_addr_terminate"
+-        ]
+-        print("Terminate Jobs {}".format(all_job_ids_to_terminate))
+-        # self.job_terminate_ids.append(job_id_to_terminate)
+-
+-        self.local_data_store.set_lease_status_rank0_batch_false(
+-            all_job_ids_to_terminate, all_corresponding_ip_address_to_terminate
+-        )
+-        # self.local_data_store.push_job_to_terminate(job_id_to_terminate)
+-        # self.local_data_store.set_lease_status_rank0(
+-        # job_id_to_terminate, ipaddr_to_terminate, False
+-        # )
+-        return rm_pb2.BooleanResponse(value=True)
+-
+-    def TerminateJobfromPeer(self, request, context) -> rm_pb2.BooleanResponse:
+-        """
+-        Terminate a job. Whose termination direction is recieved from peers
+-        Note: Every job is terminated by call from peer. This is called from Rank0
+-        """
+-        print("Called Terminate from Peer")
+-        job_id_to_terminate = json.loads(request.response)["Job_ID"]
+-        print("Terminate Job {}".format(job_id_to_terminate))
+-        # self.job_terminate_ids.append(job_id_to_terminate)
+-        # self.local_data_store.push_job_to_terminate(job_id_to_terminate)
+-        self.local_data_store.set_lease_status(job_id_to_terminate, False)
+-        return rm_pb2.BooleanResponse(value=True)
+-
+-    def GetMetrics(self, request, context) -> rm_pb2.JsonResponse:
+-        """
+-        Return metrics as requested by resource manager
+-        """
+-        self.local_data_store.delete_all_job_terminate_list()
+-        received_job = json.loads(request.response)
+-        job_data = self.local_data_store.get_job_metrics(received_job["Job_ID"])
+-        # data_to_send = dict()
+-        # data_to_send[received_job["Job_ID"]] = job_data
+-        print("Got Job metrics")
+-        print("Job data {}".format(job_data))
+-        job_data_request = rm_pb2.JsonResponse()
+-        job_data_request.response = json.dumps(job_data)
+-        print("Json dump done")
+-        self.local_data_store.reset_job_metrics(received_job["Job_ID"])
+-        return job_data_request
+-
+-    def GetLease(self, request, context) -> rm_pb2.BooleanResponse:
+-        """
+-        Return lease status. Called by blox iterator.
+-        Also writes out the current iteration number
+-        """
+-        # TODO: Put lock
+-        received_job = json.loads(request.response)
+-        job_id = received_job["Job_ID"]
+-        iteration_number = received_job["Iteration"]
+-        # print(f"{job_id},{iteration_number} server nm")
+-        lease = self.local_data_store.get_lease_status(job_id, iteration_number)
+-
+-        return rm_pb2.BooleanResponse(value=lease)
+-
+-    def SetMetrics(self, request, context) -> rm_pb2.BooleanResponse:
+-        """
+-        Push metrics from blox iterator
+-        """
+-        # TODO: Add parsing scripts when adding metrics
+-
+-        recevied_data = json.loads(request.response)
+-        job_id = recevied_data["Job_ID"]
+-        job_metrics = recevied_data["metrics"]
+-        print(f"Set metrics {job_metrics})")
+-        previous_metrics = self.local_data_store.get_job_metrics(job_id)
+-        for key in job_metrics:
+-            if key == "attained_service":
+-                if key in previous_metrics:
+-                    job_metrics[key] += previous_metrics[key]
+-                else:
+-                    pass
+-            if key == "per_iter_time":
+-                if key in previous_metrics:
+-                    job_metrics[key] = (job_metrics[key] + previous_metrics[key]) / 2
+-                else:
+-                    pass
+-            if key == "iter_num":
+-                if key in previous_metrics:
+-                    job_metrics[key] += previous_metrics[key]
+-                else:
+-                    pass
+-        self.local_data_store.set_job_metrics(job_id, job_metrics)
+-        return rm_pb2.BooleanResponse(value=True)
+-
+-    def NotifyTerminate(self, request, context) -> rm_pb2.BooleanResponse:
+-        """
+-        Blox iterator notfies the node manager on successful exit.
+-        """
+-        jobs_to_terminate = request.value
+-        # TODO: Need to decide how to handel this
+-        self.local_data_store.set_job_metrics(jobs_to_terminate, {"job_exit": True})
+-        return rm_pb2.BooleanResponse(value=True)
+-
+-    def NotifySuspend(self, request, context) -> rm_pb2.BooleanResponse:
+-        """
+-        Blox iterator notfies the node manager on successful exit.
+-        """
+-        jobs_to_terminate = request.value
+-        # TODO: Need to decide how to handel this
+-        self.local_data_store.set_job_metrics(jobs_to_terminate, {"job_suspend": True})
+-        return rm_pb2.BooleanResponse(value=True)
+-
+-    # def SetMetricsFromRM(self, request, context) -> rm_pb2.BooleanResponse:
+-    # """
+-    # Set metrics pushed from resource manager.
+-    # Resource manager calls
+-    # """
+-    # recevied_data = json.loads(request.response)
+-    # job_id = recevied_data["Job_ID"]
+-    # job_metrics = recevied_data["metrics"]
+-    # self.local_data_store.set_rm_metrics(job_id, job_metrics)
+-    # return rm_pb2.BooleanResponse(value=True)
+-
+-    # def GetMetricsFromRM(self, request, context) -> rm_pb2.JsonResponse:
+-    # """
+-    # Return the metrics pushed from the resource manager.
+-    # Application will call.
+-    # """
+-    # received_job = json.loads(request.response)
+-    # job_id = received_job["Job_ID"]
+-    # metric_to_fetch = received_job["metric"]
+-    # metric = self.local_data_store.get_rm_metrics(job_id, metric_to_fetch)
+-    # metric_response = rm_pb2.JsonResponse()
+-    # metric_response.response = json.dumps(metric)
+-    # return metric_response
+-
+-
+-def server(node_manager_port: int):
+     """
+-    Node Manager Port
+-    node_manager_port (int): Node Manager Port
++    gRPC Server running on the Node Manager, handling requests from BloxManager.
+     """
+-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=20))
+-    rm_pb2_grpc.add_RMServerServicer_to_server(NMServer(), server)
+-    server.add_insecure_port(f"[::]:{node_manager_port}")
+-    server.start()
+-    server.wait_for_termination()
++    def __init__(self):
++        # This will be set by NodeManagerMain after instantiation
++        self.node_manager: Optional['NodeManagerMain'] = None
++        logger.info("NMServer initialized, waiting for NodeManagerMain reference.")
++
++    def set_node_manager(self, node_manager_instance: 'NodeManagerMain'):
++        """Allows NodeManagerMain to link itself to the server instance."""
++        self.node_manager = node_manager_instance
++        logger.info("NodeManagerMain reference set in NMServer.")
++
++    def LaunchJob(self, request: nm_pb2.LaunchJobRequest, context) -> rm_pb2.BooleanResponse:
++        """Handles inference job launch requests from the BloxManager."""
++        if not self.node_manager:
++            logger.error("LaunchJob called before NodeManagerMain reference was set!")
++            context.set_code(grpc.StatusCode.UNAVAILABLE)
++            context.set_details("Node Manager not fully initialized")
++            return rm_pb2.BooleanResponse(value=False)
++
++        job_id = request.job_id # Use string job_id
++        logger.info(f"Received LaunchJob request for JobID: {job_id} (ReqID: {request.request_id})")
++
++        # Deserialize sampling params (assuming JSON string values)
++        try:
++            sampling_params = {k: json.loads(v) for k, v in request.sampling_params.items()}
++        except json.JSONDecodeError as e:
++             logger.error(f"Failed to decode sampling_params for job {job_id}: {e}. Params: {request.sampling_params}")
++             # Reject the job if params are invalid
++             return rm_pb2.BooleanResponse(value=False) # NAK
++        except Exception as e: # Catch other potential errors
++             logger.error(f"Error processing sampling_params for job {job_id}: {e}", exc_info=True)
++             return rm_pb2.BooleanResponse(value=False) # NAK
++
++
++        # Prepare parameters for the local scheduler/node manager
++        params = {
++            "job_id": job_id, # Pass job_id within params too if LocalScheduler needs it
++            "request_id": request.request_id,
++            "prompt": request.prompt,
++            "sampling_params": sampling_params, # The deserialized dict
++            "priority": request.priority,
++            # Add other details if needed by local scheduler/vLLM wrapper
++        }
++
++        # Pass the job to the NodeManagerMain's receive_job method
++        # This method interacts with the LocalScheduler
++        accepted = self.node_manager.receive_job(job_id, params)
++
++        if accepted:
++            logger.info(f"ACK LaunchJob for JobID: {job_id}")
++            return rm_pb2.BooleanResponse(value=True)
++        else:
++            logger.warning(f"NAK LaunchJob for JobID: {job_id} (rejected by local scheduler)")
++            return rm_pb2.BooleanResponse(value=False)
++
++
++    def InitiateMigration(self, request: nm_pb2.MigrationRequest, context):
++        """Handles request from BloxManager to start migrating a job *away* from this node."""
++        if not self.node_manager or not self.node_manager.migration_manager:
++            logger.error("InitiateMigration called before NodeManager or MigrationManager initialized!")
++            context.set_code(grpc.StatusCode.UNAVAILABLE)
++            context.set_details("Node Manager migration component not ready")
++            return rm_pb2.BooleanResponse(value=False)
++
++        job_id = request.job_id
++        target_node_ip = request.target_node
++        target_nm_address = request.target_address
++        logger.info(f"Received InitiateMigration request for job {job_id} to target {target_node_ip} ({target_nm_address})")
++
++        # Kick off the migration process in the background (non-blocking)
++        # The MigrationManager handles the actual logic in a separate thread.
++        self.node_manager.migration_manager.initiate_migration(job_id, target_node_ip, target_nm_address)
++
++        # Return True immediately to acknowledge the request was received.
++        # The actual success/failure is handled asynchronously.
++        return rm_pb2.BooleanResponse(value=True)
+ 
+ 
+-def start_server(nmserver: NMServer, node_manager_port: int) -> grpc.server:
+-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+-    nm_pb2_grpc.add_NMServerServicer_to_server(nmserver, server)
+-    server.add_insecure_port(f"[::]:{node_manager_port}")
++    def ReceiveMigration(self, request: nm_pb2.MigrationState, context):
++        """Handles receiving the state of a job being migrated *to* this node."""
++        if not self.node_manager or not self.node_manager.migration_manager:
++            logger.error("ReceiveMigration called before NodeManager or MigrationManager initialized!")
++            context.set_code(grpc.StatusCode.UNAVAILABLE)
++            context.set_details("Node Manager migration component not ready")
++            return rm_pb2.BooleanResponse(value=False)
++
++        job_id = request.job_id
++        state_blob = request.state_blob
++        logger.info(f"Received ReceiveMigration request for job {job_id} (state size: {len(state_blob)} bytes)")
++
++        # Attempt to resume the job using the received state (blocking call here)
++        # MigrationManager handles interaction with LocalScheduler and VLLMWrapper
++        success = self.node_manager.migration_manager.receive_migration(job_id, state_blob)
++
++        if success:
++            logger.info(f"Successfully accepted and resumed migrated job {job_id}.")
++            return rm_pb2.BooleanResponse(value=True) # ACK
++        else:
++            logger.error(f"Failed to accept/resume migrated job {job_id}.")
++            return rm_pb2.BooleanResponse(value=False) # NAK
++
++
++# Function to start the server (called from node_manager.py)
++def start_server(port: int) -> Tuple[grpc.Server, NMServer]:
++    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
++    nm_servicer = NMServer() # Instantiate the servicer
++    nm_pb2_grpc.add_NMServerServicer_to_server(nm_servicer, server)
++    listen_addr = f"[::]:{port}"
++    server.add_insecure_port(listen_addr)
+     server.start()
+-    return server
++    logger.info(f"Node Manager gRPC server started listening on {listen_addr}")
++    # Return both server and servicer instance so NodeManagerMain can link to it
++    return server, nm_servicer
+\ No newline at end of file
+diff --git a/blox/deployment/grpc_server_rm.py b/blox/deployment/grpc_server_rm.py
+index 4b7185f..51f87fa 100644
+--- a/blox/deployment/grpc_server_rm.py
++++ b/blox/deployment/grpc_server_rm.py
+@@ -1,174 +1,115 @@
+-import os
+-import sys
+-import time
+-import queue
+-import json
+ import grpc
+-import copy
++import json
++import uuid
+ import logging
+-import pandas as pd
++import time
+ from concurrent import futures
++from typing import TYPE_CHECKING
+ 
+-from typing import Tuple, List
+-
+-# sys.path.append(os.path.join(os.path.dirname(__file__), "grpc_stubs"))
+-sys.path.append(os.path.join(os.path.dirname(__file__), "grpc_stubs"))
+-# sys.path.append(os.path.join(os.path.dirname(__file__))
+-print(sys.path)
+-import rm_pb2 as rm_pb2
+-import rm_pb2_grpc as rm_pb2_grpc
+-import simulator_pb2 as sim_pb2
+-import simulator_pb2_grpc as sim_pb2_grpc
++# Import the generated stubs
++from blox.deployment.grpc_proto import rm_pb2,rm_pb2_grpc
+ 
+-from google.protobuf.json_format import MessageToDict
++if TYPE_CHECKING:
++    from blox_manager import BloxManager # Avoid circular import
+ 
++logger = logging.getLogger(__name__)
+ 
+ class RMServer(rm_pb2_grpc.RMServerServicer):
+-    def __init__(self, simulator_rpc_port):
+-        # new servers added
+-        self.added_servers = queue.Queue()
+-        # new jobs submitted
+-        self.new_jobs = list()
+-        # time at resource manager
+-        self.time_rm_queue = queue.Queue()
+-        self.simulator_rpc_port = simulator_rpc_port
+-
+-    def RegisterWorker(self, request, context) -> rm_pb2.BooleanResponse:
+-        """
+-        Accepts the information from the node manager.
+-        This registers the workers and the information we need
+-        """
+-        # print("Called R worker")
+-        message_processed = MessageToDict(request, including_default_value_fields=True)
+-        # TODO: Put a lock here
+-        self.added_servers.put(message_processed)
+-        # print("Length of added server queue {}".format(self.added_servers.qsize()))
++    """
++    gRPC Server running with the BloxManager, handling requests from Node Managers and Frontend.
++    """
++    def __init__(self, blox_manager_instance: 'BloxManager'):
++        self.blox_manager = blox_manager_instance
++        logger.info("RMServer initialized.")
++
++    def RegisterWorker(self, request: rm_pb2.RegisterRequest, context) -> rm_pb2.BooleanResponse:
++        """Handles worker registration calls from Node Managers."""
++        ipaddr = request.ipaddr
++        interface = request.interface
++        num_gpus = request.num_gpus
++        kv_memory = request.available_kv_memory_gb
++        models = list(request.supported_models)
++        nm_port = request.node_manager_port
++
++        logger.info(f"Received RegisterWorker request from {ipaddr}:{nm_port} (Interface: {interface}, GPUs: {num_gpus})")
++
++        # Pass registration details to BloxManager
++        success = self.blox_manager.register_worker(
++            ipaddr=ipaddr,
++            interface=interface,
++            num_gpus=num_gpus,
++            nm_port=nm_port,
++            available_kv_memory=kv_memory,
++            supported_models=models
++        )
++        return rm_pb2.BooleanResponse(value=success)
++
++    def JobCompleted(self, request: rm_pb2.JobDoneRequest, context) -> rm_pb2.BooleanResponse:
++        """Handles job completion notifications from Node Managers."""
++        job_id = request.job_id
++        success = request.success
++        logger.info(f"Received JobCompleted notification for JobID: {job_id}, Success: {success}")
++        # Notify BloxManager to update job state
++        self.blox_manager.handle_job_completion(job_id, success)
++        # Acknowledge receipt
+         return rm_pb2.BooleanResponse(value=True)
+ 
+-    def AcceptJob(self, request, context):
+-        """
+-        Accepts a new job to run from
+-        """
+-        received_job = json.loads(request.response)
+-        received_job["submit_time"] = time.time()
+-        params_to_track = received_job["params_to_track"]
+-        default_values_param = received_job["default_values"]
+-        tracking_dict = dict()
+-        for p, v in zip(params_to_track, default_values_param):
+-            tracking_dict[p] = v
+-        received_job["tracked_metrics"] = tracking_dict
+-        # received_job["time_since_scheduled"] = 0
+-        # received_job["job_priority"] = 999
+-        # TODO: Put a lock here
+-        self.new_jobs.append(received_job)
++    def MigrationComplete(self, request: rm_pb2.MigrationReport, context) -> rm_pb2.BooleanResponse:
++        """Handles migration completion notifications from the *source* Node Manager."""
++        job_id = request.job_id
++        from_node = request.from_node
++        to_node = request.to_node
++        logger.info(f"Received MigrationComplete report for JobID: {job_id} (From: {from_node}, To: {to_node})")
++        # Notify BloxManager to update job location/state
++        self.blox_manager.handle_migration_completion(job_id, from_node, to_node)
++        # Acknowledge receipt
+         return rm_pb2.BooleanResponse(value=True)
+ 
+-    def ReturnTime(self, request, context):
+-        """
+-        Returns the current time at which resource manager is
+-        """
+-        # this will block till the time is updated
+-        val = self.time_rm_queue.get()
+-        return rm_pb2.IntVal(value=val)
+-
+-    # def get_state(self) -> Tuple[List[dict], List[dict]]:
+-    # """
+-    # Threadsafe copy of active jobs and server map
+-    # # NOTE: This is old version version which returns both new jobs andnew nodes
+-    # """
+-    # # TODO: Put a lock here
+-    # new_jobs_copy = copy.deepcopy(self.new_jobs)
+-    # added_servers_copy = copy.deepcopy(self.added_servers)
+-    # self.new_jobs = list()
+-    # self.added_servers = list()
+-    # return (new_jobs_copy, added_servers_copy)
+-
+-    def get_new_jobs(self) -> List[dict]:
+-        """
+-        Threadsafe copy of new jobs
+-        """
+-        # print("In get new jobs")
+-        # TODO: Put a lock here
+-        new_jobs_copy = copy.deepcopy(self.new_jobs)
+-        self.new_jobs = list()
+-        # print("After got new jobs")
+-        return new_jobs_copy
+-
+-    def get_new_nodes(self) -> List[dict]:
+-        """
+-        Threadsafe copy of active jobs and server map
+-        # NOTE: This is old version version which returns both new jobs andnew nodes
+-        """
+-        # TODO: Put a lock here
+-        # added_servers_copy = copy.deepcopy(self.added_servers)
+-        # self.added_servers = list()
+-        added_servers_copy = list()
+-        while self.added_servers.qsize() > 0:
+-            added_servers_copy.append(self.added_servers.get())
+-        # print("Length of added servers {}".format(len(added_servers_copy)))
+-        return added_servers_copy
+-
+-    def get_new_sim_config(self):
+-        """
+-        When performing simulation get the next config to initialize the
+-        simulator
+-        """
+-        dummy_val = rm_pb2.IntVal()
+-        dummy_val.value = 10
+-        with grpc.insecure_channel(f"localhost:{self.simulator_rpc_port}") as channel:
+-            stub = sim_pb2_grpc.SimServerStub(channel)
+-            response = stub.GetConfig(dummy_val)
+-        new_config = json.loads(response.response)
+-        return new_config
+-
+-    def get_jobs_sim(
+-        self,
+-        simulator_time,
+-    ) -> List[dict]:
+-        """
+-        Get jobs when running the simulator
+-        """
+-        sim_time = rm_pb2.IntVal()
+-        sim_time.value = simulator_time
+-        # the training starts with
+-        options = [("grpc.max_receive_message_length", 10 * 1024 * 1024)]
+-        # print("Called rpc server")
+-        with grpc.insecure_channel(
+-            f"127.0.0.1:{self.simulator_rpc_port}", options=options
+-        ) as channel:
+-            stub = sim_pb2_grpc.SimServerStub(channel)
+-            response = stub.GetJobs(sim_time)
+-        # print("Rpc server return")
+-        jobs_to_run = json.loads(response.response)
+-        job_list = list(jobs_to_run.values())
+-        # for j in job_list:
+-        # params_to_track = j["params_to_track"]
+-        # default_values_param = j["default_values"]
+-        # tracking_dict = dict()
+-        # for p, v in zip(params_to_track, default_values_param):
+-        # tracking_dict[p] = v
+-        # j["tracked_metrics"] = tracking_dict
+-        # j["time_since_scheduled"] = 0
+-        # j["job_priority"] = 999
+-        return job_list
+-
+-
+-def server(rm_server_rpc_port: int):
+-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+-    rm_pb2_grpc.add_RMServerServicer_to_server(RMServer(), server)
+-    server.add_insecure_port(f"[::]:{rm_server_rpc_port}")
++    def SubmitInferenceRequest(self, request: rm_pb2.InferenceRequest, context) -> rm_pb2.InferenceResponse:
++        """Handles new inference requests submitted from the frontend."""
++        req_id = request.request_id
++        logger.info(f"Received SubmitInferenceRequest from frontend (ReqID: {req_id})")
++
++        # Deserialize sampling params (expecting JSON strings)
++        try:
++            sampling_params = {k: json.loads(v) for k, v in request.sampling_params.items()}
++        except Exception as e:
++             logger.error(f"Failed to decode sampling_params for ReqID {req_id}: {e}")
++             return rm_pb2.InferenceResponse(job_id="", accepted=False, message=f"Invalid sampling_params: {e}")
++
++        # Prepare job details dictionary
++        job_details = {
++            "request_id": req_id,
++            # Job ID will be assigned by BloxManager
++            "prompt": request.prompt,
++            "sampling_params": sampling_params, # Deserialized dict
++            "priority": request.priority,
++            "target_model": request.target_model,
++            "max_latency_ms": request.max_latency_ms,
++            "status": "pending",
++            "submit_time": time.time(),
++            "command_to_run": "inference" # Mark type
++        }
++
++        # Pass to BloxManager's queuing mechanism
++        # This method should assign a job_id and return acceptance status
++        accepted, assigned_job_id, message = self.blox_manager.add_inference_request(job_details)
++
++        if accepted:
++            logger.info(f"Accepted inference request {req_id} as JobID: {assigned_job_id}")
++            return rm_pb2.InferenceResponse(job_id=assigned_job_id, accepted=True, message=message or "Request queued")
++        else:
++            logger.warning(f"Rejected inference request {req_id}: {message}")
++            return rm_pb2.InferenceResponse(job_id="", accepted=False, message=message or "Request rejected")
++
++
++# Function to start the server (called from blox_manager.py)
++def start_server(blox_manager_instance: 'BloxManager', port: int) -> grpc.Server:
++    server = grpc.server(futures.ThreadPoolExecutor(max_workers=20)) # Allow more workers for scheduler
++    rm_servicer = RMServer(blox_manager_instance) # Instantiate the servicer
++    rm_pb2_grpc.add_RMServerServicer_to_server(rm_servicer, server)
++    listen_addr = f"[::]:{port}"
++    server.add_insecure_port(listen_addr)
+     server.start()
+-    server.wait_for_termination()
+-
+-
+-def start_server(rmserver: RMServer, rm_server_rpc_port: int) -> grpc.server:
+-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+-    rm_pb2_grpc.add_RMServerServicer_to_server(rmserver, server)
+-    server.add_insecure_port(f"[::]:{rm_server_rpc_port}")
+-    server.start()
+-    return server
+-
+-
+-if __name__ == "__main__":
+-    logging.basicConfig()
+-    server()
++    logger.info(f"BloxManager RMServer started listening on {listen_addr}")
++    return server
+\ No newline at end of file
+diff --git a/node_manager.py b/node_manager.py
+index f4db3a2..726937b 100644
+--- a/node_manager.py
++++ b/node_manager.py
+@@ -1,133 +1,331 @@
+ import time
+-import copy
+ import grpc
+ import argparse
+-import pandas as pd
++import ray
++import logging
++import asyncio # For handling async vLLM calls
+ from concurrent import futures
++from typing import Tuple, Dict, Optional, Any
+ 
+-import blox.deployment.grpc_server_nm as nm_serve
+-import blox.deployment.grpc_client_nm as nm_client
+-
+-from typing import Tuple
+-import redis
++# Blox imports
++import blox.deployment.grpc_server_nm as nm_serve # Use the updated server start function
++import blox.deployment.grpc_client_rm as rm_client # Use the updated client
++from local_scheduler import get_local_scheduler, LocalScheduler, Job # Use the new local scheduler
++from migration_manager import MigrationManager # Use the new migration manager
++from vllm_wrapper import VLLMWrapper # Use the new vLLM wrapper
+ 
++# Configure logging
++logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
++logger = logging.getLogger(__name__)
+ 
+ class NodeManagerMain(object):
+     """
+-    Main node manager class
++    Main node manager class orchestrating local scheduling, vLLM interaction, and migration.
+     """
++    def __init__(
++        self,
++        ipaddr: str, # IP of this node
++        node_manager_port: int, # Port this NM server listens on
++        central_scheduler_addr: str, # Address (ip:port) of BloxManager RMServer
++        model_name: str, # Model for vLLM
++        num_gpus: int, # GPUs for vLLM tensor parallel
++        local_scheduler_mode: str,
++        max_queue_size: int,
++        simulate: bool = False, # If true, skips Ray/vLLM init
++        ray_address: Optional[str] = None
++    ) -> None:
++        self.ipaddr = ipaddr
++        self.node_manager_port = node_manager_port
++        self.central_scheduler_addr = central_scheduler_addr
++        self.simulate = simulate
++        self.num_gpus = num_gpus
++
++        # 1. Communicator to talk back to BloxManager (RMServer)
++        self.node_manager_comm = rm_client.ResourceManagerComm(self.central_scheduler_addr)
++
++        # 2. vLLM Backend Wrapper (Initialize before Ray if needed by VLLMWrapper internals)
++        self.vllm_backend: Optional[VLLMWrapper] = None
++        if not self.simulate:
++            # Initialize Ray connection first if VLLMWrapper needs it (e.g., for worker_use_ray=True)
++            if not ray.is_initialized():
++                 try:
++                      logger.info(f"Connecting NodeManager to Ray at address: {ray_address or 'auto'}")
++                      ray.init(address=ray_address, ignore_reinit_error=True, logging_level=logging.WARNING)
++                 except Exception as e:
++                      logger.error(f"Failed to connect to Ray: {e}", exc_info=True)
++                      raise RuntimeError("Ray connection failed") from e
++            logger.info(f"NodeManager connected to Ray at {ray.get_runtime_context().ray_address}")
++
++            # Now initialize VLLMWrapper which might use Ray
++            try:
++                 # Pass relevant vLLM engine args here if needed
++                 self.vllm_backend = VLLMWrapper(model=model_name, num_gpus=num_gpus)
++            except Exception as e:
++                 logger.error(f"Failed to initialize VLLMWrapper: {e}", exc_info=True)
++                 # Should we attempt to proceed without vLLM? Probably not.
++                 raise RuntimeError("VLLMWrapper initialization failed") from e
++        else:
++             logger.info("Simulation mode: Skipping Ray and vLLM initialization.")
++
++        # 3. Local Scheduler
++        self.local_scheduler: LocalScheduler = get_local_scheduler(
++            mode=local_scheduler_mode,
++            node_id=self.ipaddr,
++            num_gpus=self.num_gpus,
++            max_queue_size=max_queue_size
++        )
++        # Set the callback for actually launching jobs
++        self.local_scheduler.set_launch_callback(self._launch_inference)
++
++        # 4. Migration Manager (Needs refs to scheduler & backend)
++        self.migration_manager: Optional[MigrationManager] = None
++        if not self.simulate and self.vllm_backend:
++            self.migration_manager = MigrationManager(
++                node_id=self.ipaddr,
++                local_scheduler=self.local_scheduler,
++                vllm_backend=self.vllm_backend,
++                rm_communicator=self.node_manager_comm # Pass RM client for notifications
++            )
++        elif not self.simulate:
++             logger.warning("Cannot initialize MigrationManager because VLLMWrapper failed.")
+ 
+-    def __init__(self, ipaddr: str, central_scheduler_port: int) -> None:
++
++        # 5. State for tracking running jobs (async tasks/futures from vLLM)
++        # Key: job_id (str), Value: asyncio Task or Future from VLLMWrapper
++        self.running_infer_tasks: Dict[str, asyncio.Task] = {}
++        self.polling_interval_sec = 0.1 # How often to check futures
++
++
++    async def poll_inference_jobs(self):
+         """
+-        Initializes node manager main class
+-        Args:
+-        ipaddr: IPaddress of the central scheduler
+-        central_scheduler_rpc_port: Central Scheduler RPC port
++        Periodically checks the status of running inference tasks managed by VLLMWrapper.
++        MUST be run within an asyncio event loop.
+         """
+-        self.ipaddr = ipaddr
+-        self.node_manager_comm = nm_client.NodeManagerComm(
+-            self.ipaddr, central_scheduler_port
+-        )
+-        # flush db at launch
+-        self.redis_client = redis.Redis(
+-            host="localhost", port=6379, decode_responses=True
+-        )
+-        self.redis_client.flushdb()
++        if self.simulate or not self.running_infer_tasks:
++            return # Nothing to poll
++
++        done_job_ids = []
++        # Iterate over a copy of items to allow modification during iteration
++        for job_id, task in list(self.running_infer_tasks.items()):
++            if task.done():
++                success = False
++                try:
++                    # Get result or exception
++                    result = task.result() # This will raise exception if task failed
++                    # Define success criteria based on VLLMWrapper's return value
++                    # Assuming it returns the vLLM RequestOutput or similar on success, None/Exception on failure
++                    if result is not None and hasattr(result, 'finished') and result.finished:
++                         logger.info(f"Inference job {job_id} completed successfully.")
++                         # logger.debug(f"Job {job_id} output: {result.outputs[0].text[:100]}...") # Log snippet
++                         success = True
++                    else:
++                         # Task finished but didn't return expected success indicator
++                         logger.warning(f"Inference job {job_id} finished with unexpected result: {result}")
++                         success = False # Treat as failure
++
++                except asyncio.CancelledError:
++                    logger.info(f"Inference job {job_id} was cancelled.")
++                    success = False # Treat cancellation as non-success
++                except Exception as e:
++                    logger.error(f"Inference job {job_id} failed with exception: {e}", exc_info=False) # Avoid overly verbose logs
++                    success = False # Treat exception as failure
++
++                # Mark for cleanup and notify components
++                done_job_ids.append(job_id)
++                self.job_done(job_id, success)
++
++        # Clean up completed tasks from tracking dict
++        for job_id in done_job_ids:
++            if job_id in self.running_infer_tasks:
++                 del self.running_infer_tasks[job_id]
++
+ 
+     def register_with_scheduler(self, interface: str) -> None:
++        """Registers this node with the central BloxManager."""
++        logger.info(f"Attempting to register with BloxManager at {self.central_scheduler_addr}")
++        registered = False
++        while not registered: # Retry loop
++             registered = self.node_manager_comm.register_with_scheduler(
++                  node_ipaddr=self.ipaddr,
++                  node_interface=interface,
++                  num_gpus=self.num_gpus,
++                  node_manager_port=self.node_manager_port, # Tell RM how to reach back
++                  # Add capability reporting if needed/implemented
++                  # available_kv_memory_gb=...,
++                  # supported_models=[self.vllm_backend.model_name],
++             )
++             if not registered:
++                  logger.warning("Failed to register with scheduler. Retrying in 5 seconds...")
++                  time.sleep(5)
++             else:
++                  logger.info("Successfully registered with scheduler.")
++
++
++    def receive_job(self, job_id: str, launch_params: dict) -> bool:
+         """
+-        Register the node with the central scheduler
++        Called by NMServer.LaunchJob. Hands off the job to the LocalScheduler.
++        Returns True (ACK) if accepted locally, False (NAK) otherwise.
+         """
+-        self.node_manager_comm.register_with_scheduler(interface)
+-        # TODO: Add a retry loop to connect to central schedule
++        if self.simulate:
++            logger.info(f"Simulate mode: Accepting job {job_id} locally.")
++            # In simulation, we might just trigger completion after a delay
++            return True
+ 
++        if not self.local_scheduler:
++            logger.error("Cannot receive job: LocalScheduler not initialized.")
++            return False
+ 
+-def parse_args(parser: argparse.ArgumentParser) -> argparse.PARSER:
+-    """
+-    Parses the arguments for node manager
+-    Args:
+-        parser: Parses argument parser
+-    Return:
+-        args: Parsed arguments
+-    """
+-    parser.add_argument(
+-        "--ipaddr", required=True, type=str, help="IP of the central scheduler"
+-    )
+-    parser.add_argument(
+-        "--interface", type=str, help="The interface to get the ipaddr from"
+-    )
++        # The LocalScheduler's submit_request handles queuing and immediate scheduling attempts
++        return self.local_scheduler.submit_request(launch_params)
+ 
+-    parser.add_argument(
+-        "--node-manager-port",
+-        default=50052,
+-        type=int,
+-        help="Node Manager RPC Port, should be same as specified as specified in the central scheduler",
+-    )
+ 
+-    parser.add_argument(
+-        "--central-scheduler-port",
+-        default=50051,
+-        type=int,
+-        help="Central Scheduler Port, should be same as specified in the central scheduler port",
+-    )
++    def _launch_inference(self, job_id: str, job_info: dict, gpu_id: int):
++        """
++        Callback function used by LocalScheduler.
++        Submits the request to the VLLMWrapper and starts tracking the task.
++        This function MUST run within the asyncio event loop.
++        """
++        if self.simulate or not self.vllm_backend:
++            logger.warning(f"Skipping actual launch of job {job_id} (Simulate mode or no VLLM backend)")
++            # TODO: Add simulation logic if needed (e.g., schedule a simulated completion event)
++            return
+ 
+-    parser.add_argument(
+-        "--debug",
+-        action="store_true",
+-        default=False,
+-        help="Used to push data for debuging",
+-    )
++        logger.info(f"Launching inference job {job_id} on assigned GPU {gpu_id} via VLLMWrapper.")
++        try:
++            # Extract necessary parameters
++            prompt = job_info["prompt"]
++            sampling_params = job_info.get("sampling_params", {})
++            request_id = job_info.get("request_id", job_id) # Use original request ID if available
+ 
+-    parser.add_argument("--ipaddr-self", type=str, help="IP address of self")
+-    parser.add_argument(
+-        "--use-redis",
+-        action="store_true",
+-        default=False,
+-        help="Use redis as data store",
+-    )
+-    parser.add_argument(
+-        "--redis-host", default="localhost", help="Location of redis server"
+-    )
++            # Ensure this runs in the event loop (NodeManager's main loop should manage this)
++            # VLLMWrapper.generate should be an async function returning an asyncio Task
++            async def run_generation():
++                 task = await self.vllm_backend.generate(
++                      request_id=job_id, # Use Blox job ID as the unique ID for vLLM tracking?
++                      prompt=prompt,
++                      sampling_params_dict=sampling_params
++                 )
++                 if task:
++                     self.running_infer_tasks[job_id] = task
++                     logger.debug(f"Started tracking asyncio task for job {job_id}")
++                 else:
++                      logger.error(f"VLLMWrapper failed to return a task for job {job_id}. Marking as failed.")
++                      # Job failed to even start properly
++                      self.job_done(job_id, False) # Notify failure
+ 
+-    parser.add_argument("--redis-port", default=6379, help="Redis port to connect")
+-    args = parser.parse_args()
++            # Schedule the async function to run in the loop
++            asyncio.create_task(run_generation())
+ 
+-    return args
++        except Exception as e:
++            logger.error(f"Failed to dispatch job {job_id} to VLLMWrapper: {e}", exc_info=True)
++            # If launch fails, treat job as failed immediately
++            self.job_done(job_id, False)
+ 
+ 
+-def launch_server(args) -> Tuple[grpc.Server, nm_serve.NMServer]:
+-    """
+-    Lauches the GRPC server and returns the server object
+-    Args:
+-        None
+-    Returns:
+-        server: GRPC server object
+-        nmserver: The class object to work with rmserver
+-    """
+-    nmserver = nm_serve.NMServer(args.use_redis, args.redis_host, args.redis_port)
+-    server = nm_serve.start_server(nmserver, args.node_manager_port)
+-    return (server, nmserver)
++    def job_done(self, job_id: str, success: bool):
++        """
++        Called internally when a job finishes (polled via poll_inference_jobs) or fails launch.
++        Notifies the global scheduler (RM) and tells the local scheduler to free resources.
++        """
++        logger.info(f"Processing completion for job {job_id}, Success: {success}")
++
++        # 1. Notify global scheduler (BloxManager/RMServer)
++        notified = self.node_manager_comm.notify_job_done(job_id, success)
++        if not notified:
++            logger.warning(f"Failed to notify BloxManager about job {job_id} completion.")
++            # TODO: Implement retry logic for RM notification?
++
++        # 2. Update local scheduler (frees GPU, triggers schedule_next)
++        if self.local_scheduler:
++            self.local_scheduler.on_job_complete(job_id)
++        else:
++             logger.error("Cannot process job completion: LocalScheduler not initialized.")
++
++        # Note: Cleanup of self.running_infer_tasks happens in poll_inference_jobs
++
++
++    async def main_loop(self):
++        """The main async loop for polling job statuses."""
++        logger.info("Node Manager main async loop started.")
++        while True:
++             await self.poll_inference_jobs()
++             await asyncio.sleep(self.polling_interval_sec)
+ 
+ 
++# --- Argument Parsing ---
++def parse_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
++    parser.add_argument("--ipaddr", required=True, help="IP address of this node manager")
++    parser.add_argument("--interface", default="eth0", help="Network interface for registration")
++    parser.add_argument("--node-manager-port", type=int, default=50051, help="Port for this Node Manager's gRPC server")
++    parser.add_argument("--central-scheduler-addr", required=True, help="Address (ip:port) of the central BloxManager RMServer")
++    parser.add_argument("--simulate", action="store_true", help="Run in simulation mode (no Ray/vLLM)")
++
++    # Ray and vLLM args
++    parser.add_argument("--ray-address", type=str, default=None, help="Address of the Ray head node (e.g., 'ray://<ip>:10001' or 'auto')")
++    parser.add_argument("--model", type=str, default="meta-llama/Llama-2-7b-hf", help="HuggingFace model name or path for vLLM")
++    parser.add_argument("--num-gpus", type=int, default=1, help="Number of GPUs for vLLM Tensor Parallelism on this node")
++    # Add other vLLM engine args if needed (e.g., --gpu-memory-utilization)
++
++    # Local Scheduler args
++    parser.add_argument("--local-scheduler-mode", choices=["fifo"], default="fifo", help="Local scheduling policy") # Add more choices later
++    # --node-memory arg removed, using num_gpus and vLLM's own management mostly
++    parser.add_argument("--max-queue-size", type=int, default=32, help="Maximum local job queue size")
++
++    args = parser.parse_args()
++    return args
++
++# --- Main Execution ---
+ def main(args):
+-    """
+-    This is the control loop of running the server.
+-    1. It initializes the node manager server
+-    2. Registers the node with resource manager
+-    """
+-    server, nmserver = launch_server(args)
+-    node_manager_main = NodeManagerMain(args.ipaddr, args.central_scheduler_port)
++    """Initializes and runs the Node Manager."""
++    try:
++        node_manager_main = NodeManagerMain(
++            ipaddr=args.ipaddr,
++            node_manager_port=args.node_manager_port,
++            central_scheduler_addr=args.central_scheduler_addr,
++            model_name=args.model,
++            num_gpus=args.num_gpus,
++            local_scheduler_mode=args.local_scheduler_mode,
++            max_queue_size=args.max_queue_size,
++            simulate=args.simulate,
++            ray_address=args.ray_address
++        )
++    except Exception as e:
++        logger.error(f"Failed to initialize NodeManagerMain: {e}", exc_info=True)
++        return # Exit if basic initialization fails
++
++    # Start gRPC server (NMServer)
++    grpc_server, nm_servicer_instance = nm_serve.start_server(args.node_manager_port)
++    # Link the running server instance to the NodeManagerMain logic controller
++    nm_servicer_instance.set_node_manager(node_manager_main)
++
++    # Register with BloxManager (retry loop inside)
+     node_manager_main.register_with_scheduler(args.interface)
++
++    # Start the main async loop for polling vLLM tasks
++    logger.info("Starting Node Manager async task polling loop.")
++    loop = asyncio.get_event_loop()
+     try:
+-        while True:
+-            pass
++        # Run the main polling loop
++        loop.run_until_complete(node_manager_main.main_loop())
+     except KeyboardInterrupt:
+-        server.stop(0)
+-        print("Exit by ctrl c")
++        logger.info("KeyboardInterrupt received. Shutting down Node Manager...")
++    except Exception as e:
++        logger.error(f"Node Manager main loop encountered an error: {e}", exc_info=True)
++    finally:
++        logger.info("Stopping gRPC server...")
++        grpc_server.stop(grace=1).wait() # Wait for graceful shutdown
++        logger.info("gRPC server stopped.")
++        if not args.simulate and ray.is_initialized():
++            logger.info("Shutting down Ray connection...")
++            ray.shutdown()
++            logger.info("Ray connection shut down.")
++        # Close the asyncio loop? Only if we started it here.
++        # loop.close()
++        logger.info("Node Manager shutdown complete.")
+ 
+ 
+ if __name__ == "__main__":
+     args = parse_args(
+-        argparse.ArgumentParser(description="Arguments for starting the node manager")
++        argparse.ArgumentParser(description="Blox Node Manager for Inference")
+     )
+-    main(args)
++    main(args)
+\ No newline at end of file
+diff --git a/placement/placement.py b/placement/placement.py
+index 7cdaa5f..073bc00 100644
+--- a/placement/placement.py
++++ b/placement/placement.py
+@@ -45,173 +45,7 @@ class JobPlacement(object):
+         job_to_launch = dict()
+         launched_job_ids = list()
+         # go over jobs in job order
+-        if scheduler == "Gavel":
+-            for idx, job_priority_sorted in enumerate(job_order):
+-                job_id, gpu_preference = list(job_priority_sorted.keys())[0]
+-                job = active_jobs[job_id]
+-                found = False
+-                if job["is_running"] == True:
+-                    if job["running_accel"] == gpu_preference:
+-                        # nothing to do here
+-                        continue
+-                    else:
+-                        # need to terminate this job trying to launch on
+-                        # different accelerator
+-                        jobs_to_terminate.append(job_id)
+-                        job["is_running"] = False
+-                        delete_job_by_id(gpu_df, job_id)
+-
+-                if job_id in launched_job_ids:
+-                    # already launched the same ID in this round
+-                    continue
+-                if job["is_running"] == False:
+-                    # need to find placement only if job is not running
+-                    place_consolidated = (
+-                        job.get("placement_preference") == "consolidated"
+-                    )
+-
+-                    free_gpus = find_free_GPUs_by_type(gpu_df, gpu_preference)
+-                    if place_consolidated:
+-                        placement, found = self._consolidated_placement(job, free_gpus)
+-                    else:
+-                        placement, found = self._scattered_placement(job, free_gpus)
+-                    if not found:
+-                        # no free GPUs
+-                        # find the GPU with same GPU preference in the reverse
+-                        # order of priority
+-                        for rev_idx in range(1, len(active_jobs) - idx):
+-                            potential_terminate_job_pair = job_order[-rev_idx]
+-                            if potential_terminate_job_pair[1] != gpu_preference:
+-                                # Job doesn't have the same preference
+-                                continue
+-                            else:
+-                                # the job has the same preference
+-
+-                                # need to check if it is running
+-                                # and if it is running on the same as current
+-                                # preference
+-                                potential_terminate_job_info = active_jobs[
+-                                    potential_terminate_job_pair[0]
+-                                ]
+-                                if (
+-                                    potential_terminate_job_info["is_running"] == True
+-                                ) and (
+-                                    potential_terminate_job_info["running_accel"]
+-                                    == gpu_preference
+-                                ):
+-                                    # only terminate in case the training is
+-                                    # also happening on the same GPU as the
+-                                    # preference
+-                                    jobs_to_terminate.append(
+-                                        potential_terminate_job_pair[0]
+-                                    )
+-                                    potential_terminate_job_info["is_running"] = False
+-                                    # freeing up GPUs
+-                                    delete_job_by_id(
+-                                        gpu_df, potential_terminate_job_pair[0]
+-                                    )
+-                                    free_gpus = find_free_GPUs_by_type(
+-                                        gpu_df, gpu_preference
+-                                    )
+-
+-                                    if place_consolidated:
+-                                        placement, found = self._consolidated_placement(
+-                                            job, free_gpus
+-                                        )
+-                                    else:
+-                                        placement, found = self._scattered_placement(
+-                                            job, free_gpus
+-                                        )
+-
+-                                    if found:
+-                                        # we found the placement
+-                                        break
+-
+-                                    # terminate this job
+-                                else:
+-                                    # job matching not found
+-                                    continue
+-                if found:
+-                    launched_job_ids.append(job_id)
+-                    job_to_launch[job_id] = placement
+-                    active_jobs[jid]["running_accel"] = gpu_preference
+-                    mark_gpu_in_use(gpu_df, placement, job_id)
+-                else:
+-                    break
+-
+-            return (jobs_to_terminate, jobs_to_launch)
+-
+-            # accel_sorted_by_pref - key: gpu_type, val: list of job ids sorted
+-            # by decreasing preference
+-
+-        if scheduler is None:
+-            running_jobs = 0
+-            new_scheduled_jobs = 0
+-            jobs_to_schedule = 0
+-            for idx, job_id in enumerate(job_order):
+-                job_id, _ = job_id
+-                job = active_jobs[job_id]
+-                found = False
+-                if job["is_running"] == True:
+-                    # move to lower priority jobs
+-                    running_jobs += 1
+-                    continue
+-                if job["is_running"] == False:
+-                    # need to find placement only if job is not running
+-                    place_consolidated = (
+-                        job.get("placement_preference") == "consolidated"
+-                    )
+-
+-                    # first checking if there are free GPUs
+-                    free_gpus = find_free_GPUs(gpu_df)
+-                    if place_consolidated:
+-                        placement, found = self._consolidated_placement(job, free_gpus)
+-                    else:
+-                        placement, found = self._scattered_placement(job, free_gpus)
+-                    # next checking if there are lower priority jobs which have
+-                    if not found:
+-                        # no free GPUs
+-                        # need to see if there are lower priority jobs which can be
+-                        # terminated and placement can be found then
+-
+-                        for rev_idx in range(1, len(active_jobs) - idx):
+-                            potential_job_to_terminate = active_jobs[
+-                                job_order[-rev_idx][0]
+-                            ]
+-                            if potential_job_to_terminate["is_running"] == True:
+-                                # terminate this job
+-                                jobs_to_terminate.append(job_order[-rev_idx][0])
+-                                potential_job_to_terminate["is_running"] = False
+-                                # freeing up GPUs
+-                                delete_job_by_id(gpu_df, job_order[-rev_idx][0])
+-                                free_gpus = find_free_GPUs(gpu_df)
+-                                if place_consolidated:
+-                                    placement, found = self._consolidated_placement(
+-                                        job, free_gpus
+-                                    )
+-                                else:
+-                                    placement, found = self._scattered_placement(
+-                                        job, free_gpus
+-                                    )
+-                                if found:
+-                                    # we found an assignment
+-                                    # print(
+-                                    # f"Placed {job_id} by determining to terminate{job_order[-rev_idx][0]}"
+-                                    # )
+-                                    break
+-                if found:
+-                    new_scheduled_jobs += 1
+-                    job_to_launch[job_id] = placement
+-                    # update manual-pipeline-list for bert and gpt
+-                    mark_gpu_in_use(gpu_df, placement, job_id)
+-                else:
+-                    # print(f"New Jobs scheduled {new_scheduled_jobs}")
+-                    # print(f"Jobs previously running {running_jobs}")
+-                    # print(f"Jobs terminated {len(jobs_to_terminate)}")
+-                    # print(f"Jobs in queue {len(job_order)-idx}")
+-                    break
+-            return (jobs_to_terminate, job_to_launch)
+-
++ 
+     def _consolidated_placement(
+         self, job_param: dict, free_gpus: dict
+     ) -> Tuple[list, bool]:
+diff --git a/schedulers/__init__.py b/schedulers/__init__.py
+index 85ea8a4..c27ab29 100644
+--- a/schedulers/__init__.py
++++ b/schedulers/__init__.py
+@@ -1,6 +1,61 @@
+-from .fifo import *
+-from .las import *
+-from .srtf import *
+-from .optimus import *
+-from .tiresias import *
+-from .llumnix import *
++import logging
++from typing import Dict, List, Tuple, Any, Optional
++
++logger = logging.getLogger(__name__)
++
++# Import your scheduler implementations here
++from .fifo_scheduler import FIFOScheduler # Simple baseline
++from .fifox_scheduler import FIFOxScheduler
++from .llumnix_scheduler import LlumnixScheduler # Your target scheduler
++
++# Placeholder base class (or define a formal interface)
++class BaseSchedulerPolicy:
++    def __init__(self, cluster_state=None, job_state=None, **kwargs):
++        self.cluster_state = cluster_state
++        self.job_state = job_state
++        # Store any other args passed via kwargs
++
++    def schedule(self,
++                 active_jobs: Dict[str, Any], # Current running jobs {job_id: details}
++                 pending_jobs: List[Dict[str, Any]], # Pending jobs [details] sorted by priority?
++                 nodes: Dict[str, Any], # Available nodes {node_ip: status/caps}
++                 cluster_view: Any, # Overall cluster resource view from ClusterState
++                 current_time: float
++                ) -> Tuple[Dict[str, str], List[Tuple[str, str, str]]]:
++        """
++        The main scheduling logic method.
++
++        Args:
++            active_jobs: Snapshot of currently running jobs.
++            pending_jobs: Snapshot of jobs waiting in the global queue.
++            nodes: Snapshot of worker node status and capabilities.
++            cluster_view: Snapshot of overall cluster resources.
++            current_time: Current scheduler time (for time-sensitive policies).
++
++        Returns:
++            A tuple containing:
++            - dispatch_decisions: Dict[job_id, node_ip] - Which pending job to send to which node.
++            - migration_decisions: List[Tuple[job_id, from_node_ip, to_node_ip]] - Which running job to migrate.
++        """
++        raise NotImplementedError
++
++
++
++# --- Registry and Factory ---
++
++_POLICY_REGISTRY = {
++    "fifo": FIFOScheduler,
++    # Register your actual policies here once implemented:
++    "llumnix": LlumnixScheduler,
++    "fifox": FIFOxScheduler, # From "another output" - implement if needed
++}
++
++def make_policy(name: str, **kwargs) -> BaseSchedulerPolicy:
++    """Factory function to create a scheduler policy instance."""
++    policy_class = _POLICY_REGISTRY.get(name.lower())
++    if policy_class:
++        logger.info(f"Creating scheduler policy '{name}'")
++        return policy_class(**kwargs)
++    else:
++        logger.error(f"Unknown scheduler policy name: '{name}'. Available: {list(_POLICY_REGISTRY.keys())}")
++        raise KeyError(f"Unknown scheduler policy name: '{name}'")
+\ No newline at end of file
+diff --git a/schedulers/fifo.py b/schedulers/fifo.py
+deleted file mode 100644
+index bd9e33f..0000000
+--- a/schedulers/fifo.py
++++ /dev/null
+@@ -1,72 +0,0 @@
+-from .scheduler_policy import SchedulingPolicy
+-import pandas as pd
+-from operator import getitem
+-
+-from typing import Optional
+-
+-
+-class Fifo(SchedulingPolicy):
+-    """
+-    Implements Fifo Scheduler
+-    """
+-
+-    def __init__(self, args):
+-        """
+-        Use this to hold any extra state the scheduler wants to hold
+-        """
+-        self.metric_to_track = ["per_iter_time", "attained_service"]
+-        self.default_metric_value = [0, 0]
+-        pass
+-
+-    @SchedulingPolicy.copy_arguments
+-    def schedule(
+-        self,
+-        job_dict: dict,
+-        node_info: dict,
+-        gpu_df: pd.DataFrame,
+-        global_placement_policy: Optional[str] = None,
+-    ) -> dict:
+-        """
+-        Schedules job based on input.
+-        Args:
+-            job_dict : Original Job dict which we have sort of maintained
+-            node_info: Same dict as received from the node register.
+-            gpu_df: Contains GPU dataframe.
+-
+-        Returns:
+-                "order_job" : Mandatory key, list of dicts of jobs in the
+-                                 in the order they are supposed to run.
+-                "run_all_jobs": Some scheduler will only output the jobs to
+-                                    run which will fit on the GPU or expecting
+-                                    to perform over subscription. While some
+-                                    will just sort the value in the order and
+-                                    return the whole job sorted back. (I am not
+-                                    sure if we need this)
+-                Per Job key optional keys:
+-                placement_locations : If the scheduler is making placement decisions too.
+-                Like Gandiva does, we expect them to add a additional key in
+-                case of the dictionary. with probable places where we should
+-                place the jobs.
+-
+-                placement_preference: Further each job could have a placement
+-                preference.
+-                Like in case of tiresias. Therefore if the scheduler wants to provide a
+-                placement they can insert a key "placement_preference" for each
+-                job. If we do not find this key. We perform placement by our
+-                case. There are two kinds of placement we support
+-
+-                additional_keys:
+-                In case the user writes a custom placement policy. In that case
+-                they can update custom metrics and pass them to the placement
+-                policy. From the scheduler
+-                And read it as they like. More on this case.
+-        """
+-        sorted_job_order = sorted(
+-            job_dict.items(), key=lambda x: (x[1]["job_priority"], x[1]["submit_time"])
+-        )
+-
+-        schedule_info = dict()
+-        schedule_info["job_order"] = sorted_job_order
+-        schedule_info["run_all_jobs"] = False
+-
+-        return schedule_info
+diff --git a/schedulers/gavel.py b/schedulers/gavel.py
+deleted file mode 100644
+index 5a33a3c..0000000
+--- a/schedulers/gavel.py
++++ /dev/null
+@@ -1,124 +0,0 @@
+-from .scheduler_policy import SchedulingPolicy
+-import pandas as pd
+-from copy import deepcopy
+-from operator import getitem
+-
+-from typing import Optional
+-
+-from policy import Policy, PolicyWithPacking
+-from proportional import ProportionalPolicy
+-
+-
+-class Gavel(SchedulingPolicy):
+-    """
+-    Implement Gavels Maxmin Fairness Policy1
+-    """
+-
+-    def __init__(self, args, **kwargs):
+-        """ """
+-
+-        self.metric_to_track = ["per_iter_time", "attained_service"]
+-        self.default_metric_value = [0, 0]
+-        try:
+-            self.solver = kwargs["solver"]
+-        except KeyError:
+-            print("Solver not provided to Gavel")
+-        self._max_min_fairness_perf_policy = MaxMinFairnessPolicyWithPerf(self.solver)
+-
+-    def schedule(
+-        self,
+-        job_dict: dict,
+-        node_info: dict,
+-        gpu_df: pd.DataFrame,
+-        global_placement_policy: Optional[str] = None,
+-    ) -> dict:
+-
+-        # mostly copied from gavel policies/max_min_fairness.py
+-
+-        scale_factors = dict()
+-        priority_weights = dict()
+-        unflattened_throughputs = dict()
+-
+-        cluster_spec = gpu_df.GPU_type.value_counts().to_dict()
+-
+-        for jid in job_dict.keys():
+-            job_throughputs[jid] = job_dict[jid]["throughput"]
+-            scale_factors[jid] = job_dict[jid]["job_gpu_demand"]
+-            priority_weights[jid] = job_dict[jid]["priority_weights"]
+-
+-        new_unflattened_throughput = dict()
+-
+-        for job_id in unflattened_throughputs:
+-            new_unflattened_throughputs[job_id] = {}
+-            for worker_type in unflattened_throughputs[job_id]:
+-                new_unflattened_throughputs[job_id][worker_type] = 1.0
+-
+-        allocation_gavel = self._max_min_fairness_perf_policy.get_allocation(
+-            new_unflattened_throughput, scale_factors, priority_weights, cluster_spec
+-        )
+-        return allocation_gavel
+-
+-
+-class MaxMinFairnessPolicyWithPerf(Policy):
+-    def __init__(self, solver):
+-        Policy.__init__(self, solver)
+-        self._name = "MaxMinFairness_Perf"
+-        self._proportional_policy = ProportionalPolicy()
+-
+-    def get_allocation(
+-        self,
+-        unflattened_throughputs,
+-        scale_factors,
+-        unflattened_priority_weights,
+-        cluster_spec,
+-    ):
+-        throughputs, index = super().flatten(unflattened_throughputs, cluster_spec)
+-        if throughputs is None:
+-            return None
+-        (m, n) = throughputs.shape
+-        (job_ids, worker_types) = index
+-
+-        # Row i of scale_factors_array is the scale_factor of job i
+-        # repeated len(worker_types) times.
+-        scale_factors_array = self.scale_factors_array(scale_factors, job_ids, m, n)
+-
+-        priority_weights = np.array(
+-            [1.0 / unflattened_priority_weights[job_id] for job_id in job_ids]
+-        )
+-
+-        proportional_throughputs = self._proportional_policy.get_throughputs(
+-            throughputs, index, cluster_spec
+-        )
+-        priority_weights = np.multiply(
+-            priority_weights.reshape((m, 1)),
+-            1.0 / proportional_throughputs.reshape((m, 1)),
+-        )
+-
+-        x = cp.Variable(throughputs.shape)
+-        # Multiply throughputs by scale_factors to ensure that scale_factor
+-        # is taken into account while allocating times to different jobs.
+-        # A job run on 1 GPU should receive `scale_factor` more time than
+-        # a job run on `scale_factor` GPUs if throughputs are equal.
+-        objective = cp.Maximize(
+-            cp.min(
+-                cp.sum(
+-                    cp.multiply(
+-                        np.multiply(
+-                            throughputs * priority_weights.reshape((m, 1)),
+-                            scale_factors_array,
+-                        ),
+-                        x,
+-                    ),
+-                    axis=1,
+-                )
+-            )
+-        )
+-        # Make sure that the allocation can fit in the cluster.
+-        constraints = self.get_base_constraints(x, scale_factors_array)
+-        cvxprob = cp.Problem(objective, constraints)
+-        result = cvxprob.solve(solver=self._solver)
+-
+-        if cvxprob.status != "optimal":
+-            print("WARNING: Allocation returned by policy not optimal!")
+-
+-        return super().unflatten(x.value.clip(min=0.0).clip(max=1.0), index)
+diff --git a/schedulers/las.py b/schedulers/las.py
+deleted file mode 100644
+index 963c780..0000000
+--- a/schedulers/las.py
++++ /dev/null
+@@ -1,40 +0,0 @@
+-from .scheduler_policy import SchedulingPolicy
+-import pandas as pd
+-from operator import getitem
+-
+-from typing import Optional
+-
+-
+-class Las(SchedulingPolicy):
+-    """
+-    Implements Least attained service scheduler
+-    """
+-
+-    def __init__(self, args):
+-        """
+-        Use this to hold any extra state the scheduler wants to hold
+-        """
+-        self.metric_to_track = ["per_iter_time", "attained_service"]
+-        self.default_metric_value = [0, 0]
+-
+-    @SchedulingPolicy.copy_arguments
+-    def schedule(
+-        self,
+-        job_dict: dict,
+-        node_info: dict,
+-        gpu_df: pd.DataFrame,
+-        global_placement_policy: Optional[str] = None,
+-    ) -> dict:
+-        # print(f"Job dict las {job_dict}")
+-        sorted_job_order = sorted(
+-            job_dict.items(),
+-            key=lambda x: (
+-                x[1]["job_priority"],
+-                x[1]["tracked_metrics"]["attained_service"],
+-            ),
+-        )
+-        schedule_info = dict()
+-        schedule_info["job_order"] = sorted_job_order
+-        schedule_info["run_all_jobs"] = False
+-
+-        return schedule_info
+diff --git a/schedulers/llumnix.py b/schedulers/llumnix.py
+deleted file mode 100644
+index 0e199a0..0000000
+--- a/schedulers/llumnix.py
++++ /dev/null
+@@ -1,42 +0,0 @@
+-from .scheduler_policy import SchedulingPolicy
+-import pandas as pd
+-from operator import getitem
+-
+-from typing import Optional
+-
+-
+-class Llumnix(SchedulingPolicy):
+-    """
+-    Implements Llumnix Dynamic Inference scheduler
+-    """
+-
+-    def __init__(self, args):
+-        """
+-        Use this to hold any extra state the scheduler wants to hold
+-        """
+-        self.metric_to_track = ["per_iter_time", "attained_service"]
+-        self.default_metric_value = [0, 0]
+-
+-    @SchedulingPolicy.copy_arguments
+-    def schedule(
+-        self,
+-        job_dict: dict,
+-        node_info: dict,
+-        gpu_df: pd.DataFrame,
+-        global_placement_policy: Optional[str] = None,
+-    ) -> dict:
+-        # print(f"Job dict llumnix {job_dict}")
+-        # sorted_job_order = sorted(
+-        #     job_dict.items(),
+-        #     key=lambda x: (
+-        #         x[1]["job_priority"],
+-        #         x[1]["tracked_metrics"]["attained_service"],
+-        #     ),
+-        # )
+-        schedule_info = dict()
+-        # schedule_info["job_order"] = sorted_job_order
+-        # schedule_info["run_all_jobs"] = False
+-
+-        # TO-DO
+-
+-        return schedule_info
+diff --git a/schedulers/optimus.py b/schedulers/optimus.py
+deleted file mode 100644
+index c63462e..0000000
+--- a/schedulers/optimus.py
++++ /dev/null
+@@ -1,93 +0,0 @@
+-from .scheduler_policy import SchedulingPolicy
+-import pandas as pd
+-from operator import getitem
+-import os
+-from typing import Optional
+-
+-
+-class Optimus(SchedulingPolicy):
+-    """
+-    Implements Shortest remaining time first
+-    """
+-
+-    def __init__(self, args):
+-        """
+-        Use this to hold any extra state the scheduler wants to hold
+-        """
+-        self.metric_to_track = ["per_iter_time", "attained_service"]
+-        self.default_metric_value = [0, 0]
+-        # self.marginal_utility = {'resnet50':
+-        pass
+-
+-    @SchedulingPolicy.copy_arguments
+-    def schedule(
+-        self,
+-        job_dict: dict,
+-        node_info: dict,
+-        gpu_df: pd.DataFrame,
+-        global_placement_policy: Optional[str] = None,
+-    ) -> dict:
+-        """
+-        Optimus Scheduler. Assuming the job closest to convergence is known. Similar to Pollux's, Optimus Oracle
+-        """
+-        for job in job_dict:
+-            job_dict[job]["time_remaining"] = (
+-                job_dict[job]["job_iteration_time"]
+-                * job_dict[job]["job_total_iteration"]
+-                - job_dict[job]["tracked_metrics"]["attained_service"]
+-            )
+-        sorted_job_order = sorted(
+-            job_dict.items(),
+-            key=lambda x: (x[1]["job_priority"], x[1]["time_remaining"]),
+-        )
+-
+-        schedule_info = dict()
+-        schedule_info["job_order"] = sorted_job_order
+-        schedule_info["run_all_jobs"] = False
+-        # NOTE: Borrowed from https://github.com/kzhang28/Optimus/blob/cea8c8bb39da493b5a45cdce625fe3c225c1793c/measurement/training-speed/measure-speed-placements.py#L170
+-        for jobs in sorted_job_order:
+-            jobs[1]["job_gpu_demand"] = jobs[1]["num_GPUs"]
+-            jobs[1]["total_gpus"] = os.environ["sched_load"]
+-        total_gpu_demand = self._total_gpu_demand(sorted_job_order)
+-        free_gpus = self._get_free_gpus(gpu_df) - total_gpu_demand
+-        # allocate more GPUs if there are GPUs left
+-        # the jobs are already stored in the order they will converge
+-        if len(sorted_job_order) > 0:
+-            while free_gpus > 0:
+-                # print("Outside")
+-                # print(free_gpus)
+-                for jobs in sorted_job_order:
+-                    # keep adding the number of GPUs needed by each job
+-                    jobs[1]["job_gpu_demand"] += 1
+-                    free_gpus = free_gpus - 1
+-                    # print(free_gpus)
+-                    if free_gpus == 0:
+-                        break
+-
+-        return schedule_info
+-
+-    def _total_gpu_demand(self, sorted_job_order):
+-        """
+-        Sum up the GPU demand
+-        """
+-        gpu_demand = 0
+-        for jobs in sorted_job_order:
+-            gpu_demand += int(jobs[1]["job_gpu_demand"])
+-        return gpu_demand
+-
+-    def _get_free_gpus(self, gpu_df: pd.DataFrame) -> dict:
+-        """
+-        Find the nodeID's which have free GPUs
+-        Args:
+-        gpu_df : DataFrame consisting of information about GPUs
+-        Returns:
+-        int
+-        """
+-        free_gpus = (
+-            gpu_df.loc[gpu_df["IN_USE"] == False]
+-            .groupby("Node_ID")["GPU_ID"]
+-            .apply(list)
+-            .to_dict()
+-        )
+-        number_free_gpus = sum([len(free_gpus[x]) for x in free_gpus])
+-        return number_free_gpus
+diff --git a/schedulers/proportional.py b/schedulers/proportional.py
+deleted file mode 100644
+index b20f511..0000000
+--- a/schedulers/proportional.py
++++ /dev/null
+@@ -1,53 +0,0 @@
+-import os, sys
+-sys.path.append(os.path.dirname(os.path.realpath(__file__)))
+-
+-import numpy as np
+-
+-from policy import Policy
+-
+-class ProportionalPolicy(Policy):
+-
+-    def __init__(self):
+-        self._name = 'Proportional'
+-
+-    def get_throughputs(self, throughputs, index,
+-                        cluster_spec):
+-        if throughputs is None: return None
+-        (job_ids, worker_types) = index
+-        (m, n) = throughputs.shape
+-
+-        x_proportional = self._get_allocation(
+-            throughputs, index,
+-            cluster_spec)
+-        proportional_throughputs = np.sum(np.multiply(throughputs, x_proportional),
+-                                          axis=1).reshape((m, 1))
+-        return proportional_throughputs
+-
+-    def _get_allocation(self, throughputs, index,
+-                        cluster_spec):
+-        (_, worker_types) = index
+-        (m, n) = throughputs.shape
+-
+-        # Split cluster over users (m).
+-        # x[i, j] proportional to num_workers[j].
+-        # \sum_j x[i, j] <= 1 for all i.
+-        # \sum_i x[i, j] <= 1 for all j.
+-        x = np.array([[cluster_spec[worker_type] / m for worker_type in worker_types]
+-                      for i in range(m)])
+-        max_per_row_sum = np.sum(x, axis=1).max()
+-        x = x / max_per_row_sum
+-
+-        return x
+-
+-    def get_allocation(self, unflattened_throughputs,
+-                       cluster_spec):
+-        throughputs, index = super().flatten(unflattened_throughputs,
+-                                             cluster_spec)
+-        if throughputs is None: return None
+-        (job_ids, worker_types) = index
+-        (m, n) = throughputs.shape
+-
+-        x = self._get_allocation(throughputs, index,
+-                                 cluster_spec)
+-
+-        return super().unflatten(x, index)
+diff --git a/schedulers/tiresias.py b/schedulers/tiresias.py
+deleted file mode 100644
+index 20a9dcf..0000000
+--- a/schedulers/tiresias.py
++++ /dev/null
+@@ -1,53 +0,0 @@
+-from .scheduler_policy import SchedulingPolicy
+-import pandas as pd
+-from operator import getitem
+-
+-from typing import Optional
+-
+-
+-class Tiresias(SchedulingPolicy):
+-    """
+-    Implements Least attained service scheduler
+-    """
+-
+-    def __init__(self, args, num_queus=1, service_per_queue=[1]):
+-        """
+-        Use this to hold any extra state the scheduler wants to hold
+-        """
+-        self.metric_to_track = ["per_iter_time", "attained_service"]
+-        self.default_metric_value = [0, 0]
+-        self.queues = [[] for _ in range(num_queus)]
+-        self.service_per_queue = service_per_queue
+-
+-    @SchedulingPolicy.copy_arguments
+-    def schedule(
+-        self,
+-        job_dict: dict,
+-        node_info: dict,
+-        gpu_df: pd.DataFrame,
+-        global_placement_policy: Optional[str] = None,
+-    ) -> dict:
+-        # print(f"Job dict las {job_dict}")
+-        sorted_job_order = sorted(
+-            job_dict.items(),
+-            key=lambda x: (
+-                x[1]["job_priority"],
+-                x[1]["tracked_metrics"]["attained_service"],
+-            ),
+-        )
+-        schedule_info = dict()
+-        queue_to_put_a_job = 0
+-        schedule_info["job_order"] = sorted_job_order
+-        schedule_info["run_all_jobs"] = False
+-        for jobs in sorted_job_order:
+-            #  go over jobs and put them in queues
+-            if (
+-                jobs[1]["tracked_metrics"]["attained_service"]
+-                < self.service_per_queue[queue_to_put_a_job]
+-            ):
+-                self.queues[queue_to_put_a_job].append(jobs)
+-        # final order
+-        combine_across_all_list = list()
+-        for q in self.queues:
+-            combine_across_all_list.extend(q)
+-        return schedule_info

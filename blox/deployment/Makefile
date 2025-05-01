@@ -1,9 +1,9 @@
 grpc:
-	python -m grpc_tools.protoc -I./grpc_proto --python_out=./grpc_stubs --grpc_python_out=./grpc_stubs ./grpc_proto/rm.proto
-	python -m grpc_tools.protoc -I./grpc_proto --python_out=./grpc_stubs --grpc_python_out=./grpc_stubs ./grpc_proto/nm.proto
-	python -m grpc_tools.protoc -I./grpc_proto --python_out=./grpc_stubs --grpc_python_out=./grpc_stubs ./grpc_proto/simulator.proto
-	python -m grpc_tools.protoc -I./grpc_proto --python_out=./grpc_stubs --grpc_python_out=./grpc_stubs ./grpc_proto/frontend.proto
-	python -m grpc_tools.protoc -I./grpc_proto --python_out=./grpc_stubs --grpc_python_out=./grpc_stubs ./grpc_proto/backend.proto
+	python3 -m grpc_tools.protoc -I./grpc_proto --python_out=./grpc_stubs --grpc_python_out=./grpc_stubs ./grpc_proto/rm.proto
+	python3 -m grpc_tools.protoc -I./grpc_proto --python_out=./grpc_stubs --grpc_python_out=./grpc_stubs ./grpc_proto/nm.proto
+	python3 -m grpc_tools.protoc -I./grpc_proto --python_out=./grpc_stubs --grpc_python_out=./grpc_stubs ./grpc_proto/simulator.proto
+	python3 -m grpc_tools.protoc -I./grpc_proto --python_out=./grpc_stubs --grpc_python_out=./grpc_stubs ./grpc_proto/frontend.proto
+	python3 -m grpc_tools.protoc -I./grpc_proto --python_out=./grpc_stubs --grpc_python_out=./grpc_stubs ./grpc_proto/backend.proto
 # I get confused between grpc and rcp
 rpc:
 	python -m grpc_tools.protoc -I./grpc_proto --python_out=./grpc_stubs --grpc_python_out=./grpc_stubs ./grpc_proto/rm.proto

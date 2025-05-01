@@ -1,33 +1,68 @@
 syntax = "proto3";
 
 service RMServer {
-  // Node Manager calls registers with resource manager
-  rpc RegisterWorker(RegisterRequest) returns(BooleanResponse) {}
-  rpc AcceptJob(JsonResponse) returns (BooleanResponse) {}
-  rpc ReturnTime(EmptyMsg) returns (IntVal) {}
+    // Node Manager calls registers with resource manager
+    rpc RegisterWorker(RegisterRequest) returns(BooleanResponse) {}
+    rpc AcceptJob(JsonResponse) returns (BooleanResponse) {} // Potentially rename/refactor for clarity? LaunchTrainingJob?
+    rpc ReturnTime(EmptyMsg) returns (IntVal) {}
+
+    // node → global notifications
+    rpc JobCompleted(JobDoneRequest)    returns (BooleanResponse) {}
+    rpc MigrationComplete(MigrationReport) returns (BooleanResponse) {} // Keep if migration is needed
+
+    rpc SubmitInferenceRequest(InferenceRequest) returns (InferenceResponse) {} // Frontend -> Scheduler
 }
 
-// string which directly allows us to return a JSON
 message JsonResponse{
-  string response = 1;
+    string response = 1;
 }
 
-message RegisterRequest{
-  string ipaddr = 1;
-  int32 numGPUs = 2;
-  int32 numCPUcores =3;
-  int32 memoryCapacity =4;
-  bool numaAvailable = 5;
-  map <int32, int32> cpuMaping = 6;
-  string gpuUUIDs = 7;
+message RegisterRequest {
+    string ipaddr = 1;
+    string interface = 2;
+    // Optional: Add inference capabilities reporting
+    int32 num_gpus = 3; // Report number of GPUs
+    int64 available_kv_memory_gb = 4;
+    repeated string supported_models = 5;
+    int32 node_manager_port = 6; // Port NMServer is listening on
 }
 
 message BooleanResponse{
-  bool value = 1;
+    bool value = 1;
 }
 
 message IntVal{
-  int32 value = 1;
+    int32 value = 1;
 }
 
 message EmptyMsg{}
+
+message JobDoneRequest {
+  string job_id = 1;
+  bool success = 2;
+  // Add output/metrics if needed by scheduler
+  string output_summary = 3;
+  float time_taken = 4;
+}
+
+message MigrationReport {
+  string job_id      = 1;
+  string from_node   = 2;
+  string to_node     = 3;
+}
+
+message InferenceRequest {
+    string request_id = 1;
+    string prompt = 2;
+    map<string, string> sampling_params = 3;
+    string priority = 4; // e.g., "high", "normal"
+    // constraints like target model, latency SLOs etc.
+    string target_model = 5;
+    float max_latency_ms = 6;
+}
+
+message InferenceResponse {
+    string job_id = 1; // The ID assigned by Blox if accepted
+    bool accepted = 2;
+    string message = 3; // e.g., "Request queued" or "Rejected: overloaded"
+}

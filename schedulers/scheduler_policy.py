@@ -1,5 +1,39 @@
 import copy
+from typing import Any, Dict, List, Tuple
 import pandas as pd
+
+
+# Placeholder base class (or define a formal interface)
+class BaseSchedulerPolicy:
+    def __init__(self, cluster_state=None, job_state=None, **kwargs):
+        self.cluster_state = cluster_state
+        self.job_state = job_state
+        # Store any other args passed via kwargs
+
+    def schedule(self,
+                 active_jobs: Dict[str, Any], # Current running jobs {job_id: details}
+                 pending_jobs: List[Dict[str, Any]], # Pending jobs [details] sorted by priority?
+                 nodes: Dict[str, Any], # Available nodes {node_ip: status/caps}
+                 cluster_view: Any, # Overall cluster resource view from ClusterState
+                 current_time: float
+                ) -> Tuple[Dict[str, str], List[Tuple[str, str, str]]]:
+        """
+        The main scheduling logic method.
+
+        Args:
+            active_jobs: Snapshot of currently running jobs.
+            pending_jobs: Snapshot of jobs waiting in the global queue.
+            nodes: Snapshot of worker node status and capabilities.
+            cluster_view: Snapshot of overall cluster resources.
+            current_time: Current scheduler time (for time-sensitive policies).
+
+        Returns:
+            A tuple containing:
+            - dispatch_decisions: Dict[job_id, node_ip] - Which pending job to send to which node.
+            - migration_decisions: List[Tuple[job_id, from_node_ip, to_node_ip]] - Which running job to migrate.
+        """
+        raise NotImplementedError
+
 
 
 class SchedulingPolicy(object):

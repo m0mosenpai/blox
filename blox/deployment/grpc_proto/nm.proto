@@ -1,15 +1,40 @@
 syntax = "proto3";
-
 import "rm.proto";
 
 service NMServer {
-  rpc LaunchJob(JsonResponse) returns(BooleanResponse) {}
-  rpc TerminateJob(JsonResponse) returns(BooleanResponse) {}
-  rpc TerminateJobfromPeer(JsonResponse) returns(BooleanResponse) {}
-  rpc GetMetrics(JsonResponse) returns (JsonResponse) {}
-  rpc SetMetrics(JsonResponse) returns (BooleanResponse) {}
-  rpc GetLease(JsonResponse) returns (BooleanResponse) {}
-  rpc NotifyTerminate(IntVal) returns (BooleanResponse) {}
-  
+    rpc LaunchJob(LaunchJobRequest) returns (BooleanResponse) {} // Modified to be explicit
+    rpc TerminateJob(TerminateJobRequest) returns(BooleanResponse) {}
+    rpc TerminateJobfromPeer(TerminateJobRequest) returns(BooleanResponse) {}
+    rpc GetMetrics(JsonResponse) returns (JsonResponse) {}
+    rpc SetMetrics(JsonResponse) returns (BooleanResponse) {}
+    rpc GetLease(JsonResponse) returns (BooleanResponse) {}
+    rpc NotifyTerminate(IntVal) returns (BooleanResponse) {}
+    
+    // ----- migration APIs ----- 
+    rpc InitiateMigration(MigrationRequest) returns (BooleanResponse) {}
+    rpc ReceiveMigration(MigrationState)  returns (BooleanResponse) {}
 }
 
+message TerminateJobRequest { 
+  string job_id = 1; 
+}
+
+// --- Modified for Inference ---
+message LaunchJobRequest {
+    string job_id = 1;
+    string request_id = 2;
+    string prompt = 3;
+    map<string, string> sampling_params = 4;
+    string priority = 5;
+}
+
+message MigrationRequest {
+  string job_id        = 1;
+  string target_node   = 2;
+  string target_address= 3;
+}
+
+message MigrationState {
+  string job_id   = 1;
+  bytes  state_blob = 2;
+}

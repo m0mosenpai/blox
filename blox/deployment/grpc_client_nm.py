@@ -1,148 +1,163 @@
+# blox/deployment/grpc_client_nm.py
+
 import os
 import sys
-import json
 import grpc
-import numa
+import json
 import logging
-import subprocess
-import re
-from concurrent import futures
+from typing import Dict, List, Tuple, Any
 
-from typing import Optional
-
+# Import the generated stubs for the Node Manager service
 sys.path.append(os.path.join(os.path.dirname(__file__), "grpc_stubs"))
-import rm_pb2
-import rm_pb2_grpc
+import nm_pb2,nm_pb2_grpc, rm_pb2
 
+logger = logging.getLogger(__name__)
 
 class NodeManagerComm(object):
     """
-    Node Manager communication class
+    gRPC Client used by BloxManager to send commands to Node Managers (NMServer).
+    Each method targets a specific Node Manager address.
     """
 
-    def __init__(self, ipaddr: str, central_scheduler_port: int) -> None:
-        """
-        Initializes Node Manager Communication module.
-        Args:
-         ipaddr: IP-address and the port for resource managers GRPC server.
-                 Format - ip:port
-        """
-        self.ipaddr = f"{ipaddr}:{central_scheduler_port}"
-        self.ip_extract = re.compile(".?inet ([0-9.]+)")
-        self.memory_extract = re.compile(".?MemAvailable:\s+([0-9]+)")
+    # No __init__ needed, target address is provided per RPC call.
 
-    def register_with_scheduler(
-        self, interface: Optional[str] = None, nmipaddr: Optional[str] = None
+    def launch_job(
+        self,
+        target_nm_address: str, # e.g., "10.0.0.5:50051"
+        job_id: str, # Blox Job ID (string)
+        request_id: str, # Original frontend request ID (string)
+        prompt: str,
+        sampling_params: Dict[str, Any], # Will be serialized to map<string, string>
+        priority: str
     ) -> bool:
         """
-        Register with worker based on calculated statistics
+        Sends LaunchJob RPC to a specific Node Manager to start an inference job.
+
         Args:
-            interface: The interface whose IP address we intend to use for
-                       connecting to node manager.
-            nmipaddr: Node Manager ipaddress to use
+            target_nm_address: The "ip:port" address of the target Node Manager's gRPC server.
+            job_id: The unique ID assigned by BloxManager for this job.
+            request_id: The unique ID from the original frontend request.
+            prompt: The input prompt text.
+            sampling_params: Dictionary of sampling parameters. Values will be JSON encoded.
+            priority: Job priority string (e.g., "high", "normal").
+
         Returns:
-            bool
-        Raises:
-            ??
+            bool: True if the Node Manager ACKed the job (accepted it), False otherwise (NAKed or RPC error).
         """
-        if nmipaddr == None and interface == None:
-            raise AssertionError("Both IP address and enterface can not be none")
+        # Serialize complex sampling_params values to JSON strings
+        try:
+            sampling_params_str_map = {str(k): json.dumps(v) for k, v in sampling_params.items()}
+        except TypeError as e:
+            logger.error(f"Failed to JSON-serialize sampling_params for job {job_id}: {e} - Params: {sampling_params}")
+            return False # Cannot proceed if params are not serializable
 
-        if nmipaddr is not None:
-            ipaddr = nmipaddr
-        else:
-            # getting IP address from an interface
-            out = (
-                subprocess.run(
-                    f"ip -f inet addr show {interface}",
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    check=True,
-                    shell=True,
-                )
-                .stdout.decode("utf-8")
-                .strip()
-            )
-            ipaddr = self.ip_extract.findall(out)[0]
-        # getting number of GPUs
-        if os.path.isdir("/proc/driver/nvidia"):
-            numgpus = (
-                subprocess.run(
-                    "nvidia-smi --query-gpu=name --format=csv,noheader | wc -l",
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    check=True,
-                    shell=True,
-                )
-                .stdout.decode("utf-8")
-                .strip()
-            )
-            gpuuuids = process = (
-                subprocess.run(
-                    "nvidia-smi -L | awk '{print $NF}' | tr -d '[)]'",
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    check=True,
-                    shell=True,
-                )
-                .stdout.decode("utf-8")
-                .strip()
-            )
+        request = nm_pb2.LaunchJobRequest(
+            job_id=job_id,
+            request_id=request_id,
+            prompt=prompt,
+            sampling_params=sampling_params_str_map,
+            priority=priority,
+        )
 
-        else:
-            numgpus = str(0)
-        # getting memory from meminfo file
-        with open("/proc/meminfo", "r") as fin:
-            memory_data = fin.read()
+        logger.debug(f"Sending LaunchJob request for job {job_id} to {target_nm_address}")
+        try:
+            # Create a temporary channel for this specific call
+            with grpc.insecure_channel(target_nm_address) as channel:
+                stub = nm_pb2_grpc.NMServerStub(channel)
+                # Set a reasonable timeout (e.g., 10 seconds)
+                response = stub.LaunchJob(request, timeout=10)
+                logger.info(f"LaunchJob response for job {job_id} from {target_nm_address}: ACK={response.value}")
+                # Return the boolean ACK/NAK status from the Node Manager
+                return response.value
+        except grpc.RpcError as e:
+            # Log specific gRPC errors (e.g., UNAVAILABLE, DEADLINE_EXCEEDED)
+            status_code = e.code()
+            logger.error(f"gRPC error launching job {job_id} on {target_nm_address}: Status={status_code}, Details={e.details()}")
+            return False # Treat RPC error as NAK
+        except Exception as e:
+            # Catch other potential errors during the call
+            logger.error(f"Unexpected error launching job {job_id} on {target_nm_address}: {e}", exc_info=True)
+            return False
 
-        memoryCapacity = self.memory_extract.findall(memory_data)[0]
-        request_to_rm = rm_pb2.RegisterRequest()
-        request_to_rm.ipaddr = ipaddr
-        request_to_rm.numGPUs = int(numgpus)
-        request_to_rm.memoryCapacity = int(memoryCapacity)
-        request_to_rm.gpuUUIDs = gpuuuids
-        # TODO: Eventually fix this to send the full list
-        if numa.available():
-            last_node = 0
-            for node in range(numa.get_max_node()):
-                temp_mapping = list(numa.node_to_cpus(node))[-1]
-                request_to_rm.cpuMaping[node] = temp_mapping
-                last_node = node
-                num_cpu_cores = temp_mapping
-            # copying the last know cpu core to numCPUcores
-            # request_to_rm.numCPUcores = list(numa.node_to_cpus(last_node))[-1]
-            request_to_rm.numCPUcores = num_cpu_cores
-            request_to_rm.numaAvailable = True
-        else:
-            numCPUcores = (
-                subprocess.run(
-                    "getconf _NPROCESSORS_ONLN",
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    check=True,
-                    shell=True,
-                )
-                .stdout.decode("utf-8")
-                .strip()
-            )
-            request_to_rm.numCPUcores = int(numCPUcores)
-            request_to_rm.numaAvailable = False
-            # putting dummy value in the cpuMaping dictionary
-            request_to_rm.cpuMaping[0] = 0
-        # sending the data to insecure channel
-        print(self.ipaddr)
-        with grpc.insecure_channel(self.ipaddr) as channel:
-            stub = rm_pb2_grpc.RMServerStub(channel)
-            response = stub.RegisterWorker(request_to_rm)
-            print(request_to_rm)
-            print(response.value)
+    def initiate_migration(
+        self,
+        source_nm_address: str, # Address of the NM currently holding the job
+        job_id: str,            # Job to migrate
+        target_node_ip: str,    # IP address of the destination node
+        target_node_nm_address: str # Full "ip:port" of the destination NM server
+        ) -> bool:
+        """
+        Sends InitiateMigration RPC to the source Node Manager to start migrating a job away.
 
+        Args:
+            source_nm_address: "ip:port" of the Node Manager currently running the job.
+            job_id: The ID of the job to migrate.
+            target_node_ip: The IP address of the node where the job should be migrated to.
+            target_node_nm_address: The full "ip:port" of the Node Manager server on the target node.
 
-def run():
-    nmc = NodeManagerComm("localhost")
-    nmc.register_with_scheduler(interface="enp2s0f0")
+        Returns:
+            bool: True if the source Node Manager acknowledged the migration initiation request, False otherwise.
+                  Note: This only acknowledges the request; actual migration happens asynchronously.
+        """
+        request = nm_pb2.MigrationRequest(
+            job_id=job_id,
+            target_node=target_node_ip,
+            target_address=target_node_nm_address
+        )
+        logger.debug(f"Sending InitiateMigration for job {job_id} to source node {source_nm_address} (Target: {target_node_nm_address})")
+        try:
+            with grpc.insecure_channel(source_nm_address) as channel:
+                stub = nm_pb2_grpc.NMServerStub(channel)
+                # Timeout for acknowledging the initiation request
+                response = stub.InitiateMigration(request, timeout=10)
+                logger.info(f"InitiateMigration response for job {job_id} from {source_nm_address}: Success={response.value}")
+                # Return whether the source node accepted the request to start migrating
+                return response.value
+        except grpc.RpcError as e:
+            status_code = e.code()
+            logger.error(f"gRPC error initiating migration for job {job_id} on {source_nm_address}: Status={status_code}, Details={e.details()}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error initiating migration for job {job_id} on {source_nm_address}: {e}", exc_info=True)
+            return False
 
+    def notify_terminate(self, target_nm_address: str, job_id: str) -> bool:
+        """
+        Sends NotifyTerminate RPC to a specific Node Manager to request cancellation
+        of a running inference job.
 
-if __name__ == "__main__":
-    logging.basicConfig()
-    run()
+        Args:
+            target_nm_address: The "ip:port" address of the Node Manager running the job.
+            job_id: The ID of the job to terminate/cancel.
+
+        Returns:
+            bool: True if the Node Manager acknowledged the termination request, False otherwise.
+                  Note: This only acknowledges the request; actual cancellation might take time.
+        """
+        # Ensure you have defined TerminateJobRequest in your nm.proto
+        request = nm_pb2.TerminateJobRequest(job_id=job_id)
+
+        logger.debug(f"Sending NotifyTerminate request for job {job_id} to {target_nm_address}")
+        try:
+            with grpc.insecure_channel(target_nm_address) as channel:
+                stub = nm_pb2_grpc.NMServerStub(channel)
+                # Timeout for acknowledging the termination request
+                response = stub.NotifyTerminate(request, timeout=10)
+                logger.info(f"NotifyTerminate response for job {job_id} from {target_nm_address}: Acknowledged={response.value}")
+                # Return whether the node acknowledged the cancellation request
+                return response.value
+        except grpc.RpcError as e:
+            status_code = e.code()
+            # Don't log error if the job is already gone (NOT_FOUND)
+            if status_code == grpc.StatusCode.NOT_FOUND:
+                 logger.warning(f"NotifyTerminate for job {job_id} failed on {target_nm_address}: Job not found (likely already completed).")
+                 return False # Or True, as the goal (job gone) is achieved? False is safer.
+            else:
+                 logger.error(f"gRPC error terminating job {job_id} on {target_nm_address}: Status={status_code}, Details={e.details()}")
+                 return False
+        except Exception as e:
+            logger.error(f"Unexpected error terminating job {job_id} on {target_nm_address}: {e}", exc_info=True)
+            return False
+
+    # --- Other potential methods (if needed) ---
+    # e.g., querying node status, updating leases (if using training features)
