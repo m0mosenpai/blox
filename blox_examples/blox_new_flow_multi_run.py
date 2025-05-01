@@ -71,8 +71,12 @@ def main(args):
 
             elif args.scheduler_name == "Optimus":
                 scheduling_policy = schedulers.Optimus(args)
+
             elif args.scheduler_name == "Tiresias":
                 scheduling_policy = schedulers.Tiresias(args)
+
+            elif args.scheduler_name == "Pcs":
+                scheduling_policy = schedulers.Pcs(args)
 
             else:
                 raise NotImplemented(f"{args.scheduler_name} not Implemented")

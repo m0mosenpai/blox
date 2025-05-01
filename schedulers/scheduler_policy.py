@@ -1,5 +1,6 @@
 import copy
 import pandas as pd
+from blox import ClusterState
 
 
 class SchedulingPolicy(object):
@@ -14,6 +15,7 @@ class SchedulingPolicy(object):
                 job_state.active_jobs,
                 cluster_state.server_map,
                 cluster_state.gpu_df,
+                cluster_state
                 # **copy.deepcopy(kwargs)
             )
 
@@ -36,7 +38,7 @@ class SchedulingPolicy(object):
     # if you inherit it, it is not going to be the same.
     @copy_arguments.__func__
     def schedule(
-        self, job_dict: dict, node_info: dict, gpu_df: pd.DataFrame, **kwargs
+            self, job_dict: dict, node_info: dict, gpu_df: pd.DataFrame, cluster_state: ClusterState, **kwargs
     ) -> dict:
         """
         Implement the scheduling mechanism

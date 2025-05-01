@@ -84,10 +84,10 @@ class SimulatorRunner(simulator_pb2_grpc.SimServerServicer):
         self.prev_job_time = 0
         self.latest_job = None
         self.prev_job = None
-        # first_job_config = self.simulator_config.pop(0)
-        # self.workload = self._generate_workload(first_job_config)
-
         self.random_seed = 1
+        first_job_config = self.simulator_config.pop(0)
+        self.workload = self._generate_workload(first_job_config)
+
         self.exp_prefix = exp_prefix
 
         return None

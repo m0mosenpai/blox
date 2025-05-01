@@ -88,6 +88,7 @@ def parse_args(parser):
 
     parser.add_argument(
         "--placement-name",
+        # default="Pcs",
         default="Pcs",
         type=str,
         help="Name of the scheduling strategy",
@@ -168,7 +169,7 @@ def main(args):
         args.start_id_track = new_config["start_id_track"]
         args.stop_id_track = new_config["stop_id_track"]
         print(
-            f"Running Scheduler {args.scheduler_name}\nLoad {args.load} \n Placement Policy {args.placement_name} \nAcceptance Policy {args.acceptance_policy} \nTracking jobs from {args.start_id_track} to {args.stop_id_track}"
+            f"Running Scheduler {args.scheduler_name}\nLoad {args.load} \nPlacement Policy {args.placement_name} \nAcceptance Policy {args.acceptance_policy} \nTracking jobs from {args.start_id_track} to {args.stop_id_track}"
         )
         blox_instance.reset(args)
         cluster_state = ClusterState(args)
