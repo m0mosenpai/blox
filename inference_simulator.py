@@ -48,8 +48,12 @@ class InferenceWorkloadGenerator:
             self.arrival_rate = config.get("arrival_rate", 10.0) # reqs/sec
             self.avg_prompt_len = config.get("avg_prompt_len", 512)
             self.avg_output_len = config.get("avg_output_len", 256)
-            self.priority_distribution = config.get("priority_distribution", {"high": 0.1, "normal": 0.8, "low": 0.1})
-            # Simple exponential distribution for lengths for now
+            self.priority_distribution = config.get("priority_distribution", {"normal": 1.0})
+            # Validate distribution sums roughly to 1
+            if not math.isclose(sum(self.priority_distribution.values()), 1.0):
+                logger.warning(f"Priority distribution probabilities do not sum to 1: {self.priority_distribution}. Normalizing or using default.")
+                # Optionally normalize or fallback
+                self.priority_distribution = {"normal": 1.0}
         else:
             raise ValueError(f"Unknown workload type: {self.workload_type}")
 
@@ -94,13 +98,18 @@ class InferenceWorkloadGenerator:
         self.last_arrival_time = arrival_time
 
         prompt_len = max(1, int(random.expovariate(1.0 / self.avg_prompt_len)))
+        # Ensure very long outputs possible for Paging test if avg is high
         output_len = max(1, int(random.expovariate(1.0 / self.avg_output_len)))
+        if self.avg_output_len > 1000 and random.random() < 0.1: # 10% chance of extra long tail
+             output_len = max(output_len, int(self.avg_output_len * (1.5 + random.expovariate(1.0))))
 
-        # Choose priority based on distribution
+
         priority_rand = random.random()
         cumulative_prob = 0.0
-        priority = "low" # Default if something goes wrong
-        for prio, prob in self.priority_distribution.items():
+        priority = list(self.priority_distribution.keys())[-1] # Default to last key
+        # Iterate in a defined order if needed (e.g., high, normal, low)
+        # sorted_priorities = sorted(self.priority_distribution.items(), key=lambda item: PRIORITY_MAP.get(item[0], 99))
+        for prio, prob in self.priority_distribution.items(): # Dict order is okay in Python 3.7+
              cumulative_prob += prob
              if priority_rand <= cumulative_prob:
                   priority = prio
@@ -156,6 +165,15 @@ class SimulatedVllmEngine:
         self.kv_bytes_per_token = config.get("kv_bytes_per_token", 2 * 2 * 2) # Example: 2 layers * 2 bytes/dtype * 2 (key+value) - Needs real model info!
         self.max_kv_tokens = int(config.get("kv_cache_size_gb", 4) * (1024**3) / self.kv_bytes_per_token)
 
+        # Get simulation flags from the node's config (passed down from args)
+        self.simulate_strict_kv = config.get("simulate_strict_kv", False)
+        self.simulate_paging = config.get("simulate_paging", False)
+        self.paging_penalty_factor = config.get("paging_penalty_factor", 1.1)
+        # Calculate the "GPU Only" KV limit based on the *original* per-GPU config
+        # This requires passing the original base value or calculating it back
+        base_kv_gb = config.get("base_vllm_kv_cache_gb", 4.0) # Need to pass this base value in config
+        self.gpu_kv_limit_tokens = int(base_kv_gb * (1024**3) / self.kv_bytes_per_token) if self.kv_bytes_per_token > 0 else 0
+
         self.queued_requests: deque[Dict[str, Any]] = deque()
         self.active_batch: List[Dict[str, Any]] = []
         self.batch_finish_time: Optional[float] = None
@@ -168,17 +186,52 @@ class SimulatedVllmEngine:
         # Simplified: assumes prompt_len + output_len occupy cache for duration
         estimated_tokens = request["prompt_len"] + request["output_len"]
         return (self.current_kv_tokens + estimated_tokens) <= self.max_kv_tokens
+    
+    def _can_fit_kv_strict(self, request: Dict[str, Any]) -> bool:
+         """Checks if request fits within the 'GPU only' KV limit."""
+         estimated_tokens = request["prompt_len"] + request["output_len"]
+         # Check against GPU limit AND total limit for safety
+         return ((self.current_kv_tokens + estimated_tokens) <= self.gpu_kv_limit_tokens and
+                 (self.current_kv_tokens + estimated_tokens) <= self.max_kv_tokens)
+
 
     def add_request(self, request: Dict[str, Any]) -> bool:
         """Add request to internal queue if initial KV check passes."""
-        if self._can_fit_kv(request): # Check if it *could* potentially fit eventually
+        job_id = request['job_id'] 
+
+        can_add = False
+        if self.simulate_strict_kv:
+            # Baseline: Reject if it wouldn't fit in simulated GPU KV
+            if self._can_fit_kv_strict(request):
+                can_add = True
+            else:
+                 kv_needed = request["prompt_len"] + request["output_len"]
+                 logger.warning(f"Node {self.node_id} GPU {self.gpu_id}: Rejecting job {job_id} - STRICT KV limit (Need: {kv_needed}, Used: {self.current_kv_tokens}, GPU Max: {self.gpu_kv_limit_tokens})")
+                 can_add = False
+        elif self.simulate_paging:
+             # Paging sim: Allow if fits *total* KV (GPU+CPU), penalty applied later
+             if self._can_fit_kv(request):
+                  can_add = True
+             else:
+                  kv_needed = request["prompt_len"] + request["output_len"]
+                  logger.warning(f"Node {self.node_id} GPU {self.gpu_id}: Rejecting job {job_id} - Paging sim BUT exceeds TOTAL KV limit (Need: {kv_needed}, Used: {self.current_kv_tokens}, Total Max: {self.max_kv_tokens})")
+                  can_add = False
+        else:
+             # Default behavior (if neither flag set): Check against total KV limit
+             if self._can_fit_kv(request):
+                  can_add = True
+             else:
+                  kv_needed = request["prompt_len"] + request["output_len"]
+                  logger.warning(f"Node {self.node_id} GPU {self.gpu_id}: Rejecting job {job_id} - Default check exceeds TOTAL KV limit (Need: {kv_needed}, Used: {self.current_kv_tokens}, Total Max: {self.max_kv_tokens})")
+                  can_add = False
+
+        if can_add:
             self.queued_requests.append(request)
-            logger.debug(f"Node {self.node_id} GPU {self.gpu_id}: Queued job {request['job_id']} (Qsize: {len(self.queued_requests)})") # <<< DEBUG >>>
+            logger.debug(f"Node {self.node_id} GPU {self.gpu_id}: Queued job {job_id} (Qsize: {len(self.queued_requests)})")
             return True
         else:
-            kv_needed = request["prompt_len"] + request["output_len"]
-            logger.warning(f"Node {self.node_id} GPU {self.gpu_id}: Rejecting job {request['job_id']} - KV limit (Need: {kv_needed}, Have: {self.max_kv_tokens - self.current_kv_tokens}, Max: {self.max_kv_tokens})") # <<< DEBUG >>>
-            return False
+            return False # Request rejected
+
 
     def _form_batch(self) -> List[Dict[str, Any]]:
         """Attempts to form a batch from the queue based on limits."""
@@ -186,23 +239,22 @@ class SimulatedVllmEngine:
         potential_kv_load = self.current_kv_tokens
         indices_to_remove = []
 
-        # Simple greedy batching: Take from front of queue if fits
+         # Check uses total max KV tokens, regardless of strict/paging mode
+        # because even paging needs *some* limit. Strict check is done on entry.
         for i, req in enumerate(self.queued_requests):
-            if len(batch) >= self.max_batch_size:
-                break
-
-            req_kv_estimate = req["prompt_len"] + req["output_len"] # Simplified estimate
+            if len(batch) >= self.max_batch_size: break
+            req_kv_estimate = req["prompt_len"] + req["output_len"]
+            # Check if adding this request exceeds the *total* KV capacity
             if (potential_kv_load + req_kv_estimate) <= self.max_kv_tokens:
                 batch.append(req)
                 potential_kv_load += req_kv_estimate
                 indices_to_remove.append(i)
-            # else: logger.debug(f"Req {req['job_id']} kv {req_kv_estimate} exceeds limit {self.max_kv_tokens - potential_kv_load}")
+            # else: logger.debug(f"Req {req['job_id']} kv {req_kv_estimate} exceeds total limit {self.max_kv_tokens - potential_kv_load} for batch formation")
 
-        # Remove selected requests from queue (in reverse index order to avoid shifting issues)
         for i in sorted(indices_to_remove, reverse=True):
             del self.queued_requests[i]
-
         return batch
+
 
     def update(self, current_time: float) -> List[Tuple[str, bool]]:
         """Advance simulation: check completions, form new batch."""
@@ -247,7 +299,15 @@ class SimulatedVllmEngine:
                     req.setdefault("prefill_end_time", current_time + self.ttft)
                     req.setdefault("streaming_start_time", current_time + self.ttft)
                     max_output = max(max_output, req["output_len"])
-                processing_time = self.ttft + (self.tpot * max_output)
+                
+                base_processing_time = self.ttft + (self.tpot * max_output)
+                processing_time = base_processing_time
+                # Apply paging penalty if paging enabled and GPU limit exceeded
+                if self.simulate_paging and self.current_kv_tokens > self.gpu_kv_limit_tokens:
+                     penalty = self.paging_penalty_factor
+                     processing_time *= penalty
+                     logger.info(f"Node {self.node_id} GPU {self.gpu_id}: Applying paging penalty ({penalty:.2f}x). KV Used: {self.current_kv_tokens}, GPU Limit: {self.gpu_kv_limit_tokens}. Base time: {base_processing_time:.4f}s, Penalized time: {final_processing_time:.4f}s") # <<< Log Penalty
+                
                 if processing_time <= 0:
                     logger.warning(f"Node {self.node_id} GPU {self.gpu_id}: Calculated zero or negative processing time ({processing_time:.4f}) for batch. Using small default.")
                     processing_time = 0.001
@@ -258,8 +318,6 @@ class SimulatedVllmEngine:
                 job_ids = [j['job_id'] for j in self.active_batch]
                 # <<< DEBUG: Changed log level >>>
                 logger.info(f"Node {self.node_id} GPU {self.gpu_id}: Starting batch (size {len(self.active_batch)}, KV {batch_kv}/{self.max_kv_tokens}) at {current_time:.3f}. Finish est: {self.batch_finish_time:.3f}. Jobs: {job_ids}")
-                logger.debug(f"Node {self.node_id} GPU {self.gpu_id}: Est Proc Time: {processing_time:.4f} (TTFT: {self.ttft:.4f}, MaxOutput: {max_output}, TPOT: {self.tpot:.4f})") # <<< DEBUG >>>
-                logger.debug(f"Node {self.node_id} GPU {self.gpu_id}: Current KV: {self.current_kv_tokens}") # <<< DEBUG >>>
 
         return completed_jobs        
 
@@ -380,6 +438,11 @@ class SimulatedNodeManager:
         logger.info(f"Node {node_id}: Scaled Engine Config - Max Batch: {engine_config['max_batch_size']}, KV Cache GB: {engine_config['kv_cache_size_gb']}")
         # <<< END FIX >>>
 
+        engine_config["simulate_strict_kv"] = config.get("simulate_strict_kv", False)
+        engine_config["simulate_paging"] = config.get("simulate_paging", False)
+        engine_config["paging_penalty_factor"] = config.get("paging_penalty_factor", 1.1)
+        # Pass the *original* base KV GB per GPU for calculating the GPU-only limit
+        engine_config["base_vllm_kv_cache_gb"] = base_kv_gb
         # Pass the SCALED config to the engine
         self.engine = SimulatedVllmEngine(node_id, 0, engine_config)
         # Pass the ORIGINAL node config to local scheduler if it needs max_local_queue_size etc.
@@ -595,19 +658,37 @@ def run_simulation(args):
 
     # --- Initialization ---
     sim_state = SimulationState()
-    workload_gen = InferenceWorkloadGenerator(vars(args)) # Pass args as config
+    try:
+        priority_dist = json.loads(args.workload_priority_dist)
+    except json.JSONDecodeError:
+        logger.error(f"Invalid JSON for priority distribution: {args.workload_priority_dist}. Using default.")
+        priority_dist = {"high":0.1,"normal":0.8,"low":0.1} # Fallback
+    # Add parsed dist to workload_args dict
+    workload_args = args.workload_config # Get the dict created in __main__
+    workload_args["priority_distribution"] = priority_dist
+
+    workload_gen = InferenceWorkloadGenerator(workload_args)
 
     # Initialize Nodes
     nodes: Dict[str, SimulatedNodeManager] = {}
     for i in range(args.num_nodes):
         node_id = f"node_{i+1}"
-        node_config = { "num_gpus": args.gpus_per_node, "model": args.model,"ttft": args.vllm_ttft, "tpot": args.vllm_tpot,"max_batch_size": args.vllm_max_batch_size,"kv_cache_size_gb": args.vllm_kv_cache_gb,"max_local_queue_size": args.max_local_queue_size,"kv_bytes_per_token": 8 }
+        node_config = { "num_gpus": args.gpus_per_node, "model": args.model,"ttft": args.vllm_ttft, 
+                       "tpot": args.vllm_tpot,"max_batch_size": args.vllm_max_batch_size,
+                       "kv_cache_size_gb": args.vllm_kv_cache_gb,
+                       "max_local_queue_size": args.max_local_queue_size,"kv_bytes_per_token": 8,
+                       "simulate_strict_kv": args.simulate_strict_kv,
+                       "simulate_paging": args.simulate_paging,
+                     "paging_penalty_factor": args.paging_penalty_factor,}
         node = SimulatedNodeManager(node_id, node_config)
         node.sim_state = sim_state
         nodes[node_id] = node
         sim_state.gpu_busy_time[node_id] = 0.0
         sim_state.node_batch_counts[node_id] = 0
         sim_state.node_batch_size_sum[node_id] = 0
+        sim_state.local_queue_naks[node_id] = 0
+        sim_state.kv_reject_naks[node_id] = 0
+        sim_state.other_naks[node_id] = 0
 
     policy_args = {
          "job_timeout_sec": args.job_timeout_sec,
@@ -917,6 +998,10 @@ def parse_args():
     parser.add_argument("--enable-migration", action="store_true", help="Enable migration for supported policies (e.g., Llumnix)")
     parser.add_argument("--job-timeout-sec", type=int, default=300, help="Job timeout in seconds (for FIFOx policy)")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO", help="Set the logging level")
+    parser.add_argument("--workload-priority-dist", type=str, default='{"high":0.1,"normal":0.8,"low":0.1}', help="JSON string for priority distribution (e.g., '{\"high\":0.1,\"normal\":0.8,\"low\":0.1}')")
+    parser.add_argument("--simulate-strict-kv", action="store_true", help="Enforce strict KV limits, rejecting jobs that won't fit (Baseline for Paging)")
+    parser.add_argument("--simulate-paging", action="store_true", help="Simulate PagedAttention effect: allow exceeding KV limit with penalty")
+    parser.add_argument("--paging-penalty-factor", type=float, default=1.1, help="Slowdown factor applied to TPOT when paging is active (e.g., 1.1 = 10% slower)")
 
     return parser.parse_args()
 
@@ -924,6 +1009,7 @@ if __name__ == "__main__":
     args = parse_args()
     log_level_map = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR}
     logging.getLogger().setLevel(log_level_map.get(args.log_level, logging.INFO))
+
 
     # Pass args directly, workload generator init expects a dict
     workload_args = {
@@ -934,7 +1020,18 @@ if __name__ == "__main__":
          "avg_output_len": args.workload_avg_output_len,
          # Add priority distribution if needed
     }
-    # Add workload config to main args namespace for simplicity
+
+    try:
+        priority_dist = json.loads(args.workload_priority_dist)
+        # Basic validation
+        if not isinstance(priority_dist, dict) or not math.isclose(sum(priority_dist.values()), 1.0):
+             raise ValueError("Probabilities must sum to 1.0")
+        workload_args["priority_distribution"] = priority_dist
+    except Exception as e:
+        logger.error(f"Invalid JSON or values for --workload-priority-dist: {args.workload_priority_dist}. Error: {e}. Using default.")
+        workload_args["priority_distribution"] = {"high":0.1,"normal":0.8,"low":0.1} # Fallback
+
+    # Add workload config dict to args namespace AFTER parsing priority dist
     vars(args).update({"workload_config": workload_args})
 
     run_simulation(args)

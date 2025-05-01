@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
 from .fifo_scheduler import FIFOScheduler # Simple baseline
 from .fifox_scheduler import FIFOxScheduler
 from .llumnix_scheduler import LlumnixScheduler # Your target scheduler
+from .roundrobin_scheduler import RoundRobinScheduler
 from .scheduler_policy import BaseSchedulerPolicy
 
 
@@ -17,6 +18,7 @@ _POLICY_REGISTRY = {
     # Register your actual policies here once implemented:
     "llumnix": LlumnixScheduler,
     "fifox": FIFOxScheduler, # From "another output" - implement if needed
+    "roundrobin": RoundRobinScheduler, 
 }
 
 def make_policy(name: str, **kwargs) -> BaseSchedulerPolicy:

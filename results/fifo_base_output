@@ -1,0 +1,38 @@
+2025-05-01 01:24:44.492 [WARNING] [InferenceSimulator] Node node_1: Local NAK job blox_84c1802c-86a9-4368-b131-198a70075fb8 - local queue full (32/32)
+2025-05-01 01:24:44.493 [INFO] [InferenceSimulator] Simulation finished at time 600.010
+2025-05-01 01:24:44.493 [INFO] [InferenceSimulator] Total simulation wall clock time: 5.457 seconds
+2025-05-01 01:24:44.493 [INFO] [InferenceSimulator] === NAK Stats ===
+2025-05-01 01:24:44.493 [INFO] [InferenceSimulator]    node_1: queue-full_NAKs=2279, kv-reject_NAKs=0
+2025-05-01 01:24:44.493 [INFO] [InferenceSimulator]    node_2: queue-full_NAKs=831, kv-reject_NAKs=0
+2025-05-01 01:24:44.493 [INFO] [InferenceSimulator]    node_3: queue-full_NAKs=56, kv-reject_NAKs=0
+2025-05-01 01:24:44.493 [INFO] [InferenceSimulator]    node_4: queue-full_NAKs=0, kv-reject_NAKs=0
+2025-05-01 01:24:44.493 [INFO] [InferenceSimulator]    node_5: queue-full_NAKs=0, kv-reject_NAKs=0
+2025-05-01 01:24:44.493 [INFO] [InferenceSimulator]    node_6: queue-full_NAKs=0, kv-reject_NAKs=0
+2025-05-01 01:24:44.493 [INFO] [InferenceSimulator]    node_7: queue-full_NAKs=0, kv-reject_NAKs=0
+2025-05-01 01:24:44.493 [INFO] [InferenceSimulator]    node_8: queue-full_NAKs=0, kv-reject_NAKs=0
+2025-05-01 01:24:44.493 [INFO] [InferenceSimulator] === Batch / Utilization Stats (End of Sim) ===
+2025-05-01 01:24:44.493 [INFO] [InferenceSimulator]    node_1: batches=0, avg_batch_size=0.00, util=56.8% (BusyTime=340.750s)
+2025-05-01 01:24:44.494 [INFO] [InferenceSimulator]    node_2: batches=0, avg_batch_size=0.00, util=56.8% (BusyTime=340.560s)
+2025-05-01 01:24:44.494 [INFO] [InferenceSimulator]    node_3: batches=22, avg_batch_size=2.18, util=54.9% (BusyTime=329.480s)
+2025-05-01 01:24:44.494 [INFO] [InferenceSimulator]    node_4: batches=90, avg_batch_size=1.67, util=39.3% (BusyTime=235.950s)
+2025-05-01 01:24:44.494 [INFO] [InferenceSimulator]    node_5: batches=91, avg_batch_size=1.12, util=15.7% (BusyTime=94.450s)
+2025-05-01 01:24:44.494 [INFO] [InferenceSimulator]    node_6: batches=32, avg_batch_size=1.00, util=4.3% (BusyTime=25.860s)
+2025-05-01 01:24:44.494 [INFO] [InferenceSimulator]    node_7: batches=6, avg_batch_size=1.00, util=0.3% (BusyTime=1.860s)
+2025-05-01 01:24:44.494 [INFO] [InferenceSimulator]    node_8: batches=0, avg_batch_size=0.00, util=0.0% (BusyTime=0.000s)
+2025-05-01 01:24:44.494 [INFO] [inference_metrics] Calculating inference summary metrics...
+2025-05-01 01:24:44.509 [INFO] [inference_metrics] Metrics Summary: {'avg_e2e_latency_ms': 6468.334282950442, 'p50_e2e_latency_ms': 6321.673654251128, 'p90_e2e_latency_ms': 10066.795707470399, 'p99_e2e_latency_ms': 15420.154253240891, 'max_e2e_latency_ms': 21039.392911793188, 'completed_requests': 6029, 'throughput_req_per_sec': 10.048165863908977, 'failed_requests': 0, 'success_rate': 1.0, 'avg_gpu_utilization': 'N/A (Requires ClusterState tracking)'}
+
+--- Simulation Metrics ---
+{
+  "avg_e2e_latency_ms": 6468.334282950442,
+  "p50_e2e_latency_ms": 6321.673654251128,
+  "p90_e2e_latency_ms": 10066.795707470399,
+  "p99_e2e_latency_ms": 15420.154253240891,
+  "max_e2e_latency_ms": 21039.392911793188,
+  "completed_requests": 6029,
+  "throughput_req_per_sec": 10.048165863908977,
+  "failed_requests": 0,
+  "success_rate": 1.0,
+  "avg_gpu_utilization": "7.13%"
+}
+2025-05-01 01:24:44.650 [INFO] [InferenceSimulator] Saved final job state to fifo_base_log_slow.json
