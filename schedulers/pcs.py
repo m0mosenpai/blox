@@ -37,7 +37,8 @@ class Pcs(SchedulingPolicy):
         for job in job_dict:
             # assume linear-scaling if no demand mapping is supplied
             if not job_dict[job].get("demand_fn", None):
-                job_dict[job]["demand_fn"] = lambda n: job_dict[job]["job_duration"] / n
+                job_duration = job_dict[job]["job_duration"]
+                job_dict[job]["demand_fn"] = lambda n: job_duration / n
 
         # sort jobs in ascending order of their demand(n) = T
         sorted_jobs = sorted(
@@ -88,6 +89,9 @@ class Pcs(SchedulingPolicy):
                     demand_mean = 0
                     demand_variance = 0
                     num_queues += 1
+            # handle any remaining jobs
+            if queue:
+                buckets.append(queue)
 
             # reference: https://github.com/TuftsNATLab/PCS/blob/main/simulation/wfq_tuner.py#L319
             # calculate weights for each queue
@@ -105,8 +109,10 @@ class Pcs(SchedulingPolicy):
             assert np.isclose(float(sum(weights)), 1.0)
 
             # get number of gpus to hand out
-            free_gpus = cluster_state.cluster_stats[cluster_state.time]["free_gpus"]
-            print(f"available gpus: {free_gpus}")
+            # total_gpus = cluster_state.gpu_df.shape[0]
+            # free_gpus = (cluster_state.gpu_df["IN_USE"] == False).sum()
+            free_gpus = 4
+            # print(f"total gpus: {total_gpus}, available gpus: {free_gpus}")
 
             # initial GPU allocations per-queue (floor to round the weights)
             ideal_allocs = [w * free_gpus for w in weights]
@@ -124,24 +130,29 @@ class Pcs(SchedulingPolicy):
             buckets_d = [deque(b) for b in buckets]
             remaining_allocs = allocs[:]
 
+            # cap each job to a pre-defined max
+            for qid, b in enumerate(buckets):
+                gpus = allocs[qid]
+                for job in b:
+                    max_gpus = 1
+                    for n in range(1, gpus + 1):
+                        t_n = job[1]["demand_fn"](n)
+                        z = job[1]["demand_fn"](1) / (n * t_n)
+                        if z >= self.demand_cap:
+                            max_gpus = n
+                    allocs[qid] = max_gpus
+                    break
+
             # schedule jobs from FIFO queues in RR
-            while any(remaining_allocs):
+            while any(remaining_allocs) and sum([len(b) for b in buckets_d]):
                 for qid, b in enumerate(buckets_d):
                     if remaining_allocs[qid] > 0 and b:
                         job = b.popleft()
-                        gpus = allocs[qid]
-
-                        # cap each job to a pre-defined max
-                        max_gpus = 1
-                        for n in range(1, gpus + 1):
-                            t_n = job[1]["demand_fn"](n)
-                            z = job[1]["demand_fn"](1) / (n * t_n)
-                            if z >= self.demand_cap:
-                                max_gpus = n
+                        gpus = remaining_allocs[qid]
 
                         # update job state to reflect new gpu demands and predicted JCT
-                        job[1]["job_gpu_demand"] = max_gpus
-                        job[1]["predicted_jct"] = time.time() + job[1]["demand_fn"](max_gpus)
+                        job[1]["job_gpu_demand"] = gpus
+                        job[1]["predicted_jct"] = time.time() + job[1]["demand_fn"](gpus)
                         schedule_order.append(job)
                         remaining_allocs[qid] -= 1
 

@@ -40,7 +40,7 @@ class SimulatorRunner(simulator_pb2_grpc.SimServerServicer):
         model_class_split=(34, 33, 33),
         ipaddr_resource_manager="localhost",
         exponential=True,
-        multigpu=False,
+        multigpu=True,
         small_trace=False,
         placement=True,
         prioritize=False,
